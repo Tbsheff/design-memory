@@ -1,6 +1,4 @@
 #!/usr/bin/env bash
-# Test skill installation without requiring Bun. CLI path resolution is checked
-# by a fake bun executable that asserts the source file actually exists.
 set -euo pipefail
 src="$(cd "$(dirname "$0")/.." && pwd -P)"
 tmp="$(mktemp -d)"
@@ -22,9 +20,9 @@ test "$(find "$HOME/.agents/skills" -name SKILL.md | wc -l | tr -d ' ')" -eq 2
 test -f "$HOME/.agents/skills/design-memory/SKILL.md.legacy"
 test ! -e "$HOME/.agents/skills/design-memory/SKILL.md"
 test "$(cat "$HOME/.design-memory/keep.txt")" = protected
-test -L "$HOME/.local/bin/taste"
+test -x "$HOME/.local/bin/taste" && test ! -L "$HOME/.local/bin/taste"
+"$HOME/.local/bin/taste" --help
 test -f "$HOME/.agents/skills/design-memory/src/app.ts"
-# Re-run using the installed runtime; the original extraction is not needed.
 bash "$HOME/.agents/skills/design-memory/install.sh"
 test "$(find "$HOME/.agents/skills" -name SKILL.md | wc -l | tr -d ' ')" -eq 2
 "$HOME/.agents/skills/taste-use/scripts/taste" --help

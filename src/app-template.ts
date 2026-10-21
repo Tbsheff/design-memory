@@ -1,4 +1,3 @@
-/** Self-contained, offline-capable UI served only while `taste open` runs. */
 import { rawHTML } from "./raw-html.ts";
 import { emptyLibrarySVG, faviconLink, logoSVG } from "./logo.ts";
 export const appHTML = rawHTML`<!doctype html>

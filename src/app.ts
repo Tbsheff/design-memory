@@ -1,6 +1,5 @@
-/** Local Taste workspace server, run on demand by `taste open` or in the background by `taste service`. */
 import { Database } from "bun:sqlite";
-import { createWriteStream, existsSync, mkdirSync, unlinkSync } from "node:fs";
+import { createWriteStream, existsSync, mkdirSync, rmSync } from "node:fs";
 import { Readable, Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { extname, join } from "node:path";
@@ -97,99 +96,134 @@ async function uploaded(root:string,db:Database,request:Request,url:URL) {
     const media=finalizeUploadedMedia(root,tmp,hash.digest("hex"),name);
     const added=await addOne(root,db,join(root,media.path),{cmd:"add",args:[name],flags},media);
     return json(added);
-  } finally {try{unlinkSync(tmp);}catch{/* no temp file */}}
+  } finally {rmSync(tmp,{force:true});}
 }
 const isLoopbackHost=(host:string|null,port:number|undefined)=>host===`127.0.0.1:${port}`;
 export function launchBrowser(address:string) {
   const cmd=process.platform==="darwin"?"open":process.platform==="win32"?"cmd":"xdg-open";
   const args=process.platform==="win32"?["/c","start","",address]:[address];
-  try {const p=spawn(cmd,args,{stdio:"ignore",detached:true});p.on("error",()=>{});p.unref();} catch{/* URL printed above */}
+  try {const p=spawn(cmd,args,{stdio:"ignore",detached:true});p.on("error",()=>{});p.unref();} catch { return; }
 }
 export type ServerOptions = { port?:number; launch?:boolean };
+type AppContext = { root:string; db:Database; page:string; secret:string; port:()=>number|undefined };
+type RequestData = Awaited<ReturnType<typeof parseJSON>>;
+type GetRoute = (ctx:AppContext, url:URL) => Response;
+type PostRoute = (ctx:AppContext, data:RequestData) => Response | Promise<Response>;
+
+const PAGE_HEADERS = {"Content-Type":"text/html; charset=utf-8","Cache-Control":"no-store","X-Content-Type-Options":"nosniff","Referrer-Policy":"no-referrer","Content-Security-Policy":"default-src 'none'; img-src 'self' data:; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'"};
+const ASSET_HEADERS = {"Cache-Control":"private, max-age=3600","X-Content-Type-Options":"nosniff"};
+
+function serveAsset(ctx:AppContext, url:URL): Response {
+  const path=validateMediaPath(url,ctx.root);
+  if (!path || !existsSync(path)) return error("Image not found",404);
+  return new Response(Bun.file(path),{headers:ASSET_HEADERS});
+}
+function referenceDetail(db:Database, id:string) {
+  const ref=getItem(db,"refs",id);
+  const media=ref.media.map(m=>({...m,original_url:fileURL(m.path),thumbnail_url:fileURL(m.thumbnail??m.path)}));
+  return {reference:{...ref,media},observations:[...records(db,"observations",id)],feedback:[...records(db,"feedback",id)]};
+}
+function profilePrompt(db:Database, project:string): string {
+  const lines=["My design preferences (explicitly confirmed):"];
+  for (const p of preferenceList(db) as Preference[]) {
+    if (p.scope!=="global" && p.project!==project) continue;
+    lines.push(`- ${p.kind==="prefer"?"Prefer":"Avoid"}${p.scope==="project"?` in ${p.project}`:""}: ${p.rule}`);
+  }
+  return lines.join("\n");
+}
+const GET_ROUTES: Record<string,GetRoute> = {
+  "/": ctx=>new Response(ctx.page,{headers:PAGE_HEADERS}),
+  "/api/list": (ctx,url)=>json(lookup(ctx.db,url.searchParams)),
+  "/api/stats": ctx=>json(stats(ctx.db)),
+  "/api/preferences": ctx=>json(preferenceList(ctx.db)),
+  "/api/ref": (ctx,url)=>json(referenceDetail(ctx.db,str(url.searchParams.get("id"),30))),
+  "/api/profile": (ctx,url)=>new Response(profilePrompt(ctx.db,str(url.searchParams.get("project"),100)),{headers:{"Content-Type":"text/plain; charset=utf-8"}}),
+};
+
+async function addSources(ctx:AppContext, data:RequestData): Promise<Response> {
+  const sources=Array.isArray(data.sources)?data.sources.filter(s=>typeof s==="string").slice(0,30) as string[]:[];
+  if (!sources.length) return error("Paste at least one URL");
+  const flags=new Map<string,string[]>();
+  const note=str(data.note,1500), project=str(data.project,100);
+  if (note) flags.set("note",[note]);
+  if (project) flags.set("project",[project]);
+  if (sources.some(source=>!/^https?:\/\//i.test(source))) throw new Error("Only website URLs can be pasted here. Drop images to upload.");
+  const items=[];
+  for (const source of sources) items.push(await addOne(ctx.root,ctx.db,source,{cmd:"add",args:[source],flags}));
+  return json({items});
+}
+function addNote(ctx:AppContext, data:RequestData): Response {
+  const id=str(data.id,30), note=str(data.note,1500);
+  if (!note) return error("Write a short note first");
+  const ref=getItem(ctx.db,"refs",id);
+  if (ref.notes.some(n=>n.text===note)) return json({saved:true});
+  ref.notes.push({text:note,added_at:now()});
+  ref.updated_at=now();
+  inTransaction(ctx.db,()=>{saveRecord(ctx.db,"refs",ref);refreshSearch(ctx.db,id);});
+  return json({saved:true});
+}
+function addFeedback(ctx:AppContext, data:RequestData): Response {
+  const id=str(data.id,30), vote=str(data.vote,16), text=str(data.text,500);
+  getItem(ctx.db,"refs",id);
+  if (!["like","dislike"].includes(vote) || !text) return error("Choose like or dislike and say what specifically");
+  const feedback:Feedback={id:itemId("fb"),ref_id:id,vote:vote as Feedback["vote"],aspect:text.slice(0,160),quote:text,reason:"",project:null,created_at:now()};
+  inTransaction(ctx.db,()=>{saveRecord(ctx.db,"feedback",feedback);refreshSearch(ctx.db,id);});
+  return json({saved:true,id:feedback.id});
+}
+function addPreference(ctx:AppContext, data:RequestData): Response {
+  const rule=str(data.rule,500), kind=str(data.kind,10), project=str(data.project,100);
+  if (!rule || !["prefer","avoid"].includes(kind)) return error("Enter a preference and choose Prefer or Avoid");
+  const p:Preference={id:itemId("pref"),kind:kind as Preference["kind"],rule,scope:project?"project":"global",project:project||null,feedback_ids:[],statement:rule,created_at:now()};
+  inTransaction(ctx.db,()=>saveRecord(ctx.db,"preferences",p));
+  return json({saved:true,id:p.id});
+}
+function retirePreference(ctx:AppContext, data:RequestData): Response {
+  const id=str(data.id,30);
+  getItem(ctx.db,"preferences",id);
+  const record=JSON.stringify({preference_id:id,reason:"Retired in Taste workspace",retired_at:now()});
+  inTransaction(ctx.db,()=>insertRetirement(ctx.db,id,record));
+  return json({retired:true});
+}
+const insertRetirement=(db:Database,id:string,record:string)=>db.query("INSERT OR IGNORE INTO retired (preference_id,data) VALUES (?,?)").run(id,record);
+const POST_ROUTES: Record<string,PostRoute> = {
+  "/api/add": addSources, "/api/note": addNote, "/api/feedback": addFeedback, "/api/preference": addPreference, "/api/retire": retirePreference,
+};
+
+function handleGet(ctx:AppContext, url:URL): Response {
+  if (url.pathname.startsWith("/asset/")) return serveAsset(ctx,url);
+  const route=GET_ROUTES[url.pathname];
+  return route ? route(ctx,url) : error("Not found",404);
+}
+function writeRejection(ctx:AppContext, req:Request): Response | undefined {
+  if (req.headers.get("x-taste-token")!==ctx.secret) return error("Unauthorized",403);
+  const origin=req.headers.get("origin");
+  if (origin && origin!==`http://127.0.0.1:${ctx.port()}`) return error("Forbidden origin",403);
+  return undefined;
+}
+async function handleWrite(ctx:AppContext, req:Request, url:URL): Promise<Response> {
+  const rejected=writeRejection(ctx,req);
+  if (rejected) return rejected;
+  if (req.method==="PUT" && url.pathname==="/api/upload") return await uploaded(ctx.root,ctx.db,req,url);
+  const route=req.method==="POST" ? POST_ROUTES[url.pathname] : undefined;
+  if (!route) return error("Not found",404);
+  return await route(ctx,await parseJSON(req));
+}
+async function routeRequest(ctx:AppContext, req:Request): Promise<Response> {
+  const url=new URL(req.url);
+  if (req.method==="GET") return handleGet(ctx,url);
+  const isApiWrite=["POST","PUT"].includes(req.method) && url.pathname.startsWith("/api/");
+  return isApiWrite ? await handleWrite(ctx,req,url) : error("Not found",404);
+}
+
 export function startApp(root:string, db:Database, opts:ServerOptions={}) {
   const secret=randomBytes(24).toString("hex");
-  const page=appHTML.replace("__TASTE_SESSION_TOKEN__",secret);
+  const ctx:AppContext={root,db,secret,page:appHTML.replace("__TASTE_SESSION_TOKEN__",secret),port:()=>server.port};
   const server=Bun.serve({
     hostname:"127.0.0.1", port: opts.port ?? 0, idleTimeout:60,
     async fetch(req) {
-      const u=new URL(req.url);
       if (!isLoopbackHost(req.headers.get("host"),server.port)) return error("Forbidden host",403);
-      try {
-        if(req.method==="GET" && u.pathname==="/") return new Response(page,{headers:{"Content-Type":"text/html; charset=utf-8","Cache-Control":"no-store","X-Content-Type-Options":"nosniff","Referrer-Policy":"no-referrer","Content-Security-Policy":"default-src 'none'; img-src 'self' data:; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'"}});
-        if(req.method==="GET" && u.pathname.startsWith("/asset/")) {
-          const path=validateMediaPath(u,root);
-          if (!path || !existsSync(path)) return error("Image not found",404);
-          return new Response(Bun.file(path),{headers:{"Cache-Control":"private, max-age=3600","X-Content-Type-Options":"nosniff"}});
-        }
-        if(req.method==="GET" && u.pathname==="/api/list") return json(lookup(db,u.searchParams));
-        if(req.method==="GET" && u.pathname==="/api/stats") return json(stats(db));
-        if(req.method==="GET" && u.pathname==="/api/preferences") return json(preferenceList(db));
-        if(req.method==="GET" && u.pathname==="/api/ref") {
-          const id=str(u.searchParams.get("id"),30);const ref=getItem(db,"refs",id);
-          return json({reference:{...ref,media:ref.media.map(m=>({...m,original_url:fileURL(m.path),thumbnail_url:fileURL(m.thumbnail??m.path)}))},observations:[...records(db,"observations",id)],feedback:[...records(db,"feedback",id)]});
-        }
-        if(req.method==="GET" && u.pathname==="/api/profile") {
-          // Copyable concise prompt, without loading any screenshots or building a gallery.
-          const project=str(u.searchParams.get("project"),100);
-          const lines=["My design preferences (explicitly confirmed):"];
-          for(const p of preferenceList(db) as Preference[]) if (p.scope==="global" || p.project===project)
-            lines.push(`- ${p.kind==="prefer"?"Prefer":"Avoid"}${p.scope==="project"?` in ${p.project}`:""}: ${p.rule}`);
-          return new Response(lines.join("\n"),{headers:{"Content-Type":"text/plain; charset=utf-8"}});
-        }
-        if (!(["POST","PUT"].includes(req.method) && u.pathname.startsWith("/api/"))) return error("Not found",404);
-        // A random session token prevents websites from silently editing this localhost library.
-        if (req.headers.get("x-taste-token")!==secret) return error("Unauthorized",403);
-        const origin=req.headers.get("origin");
-        if (origin && origin!==`http://127.0.0.1:${server.port}`) return error("Forbidden origin",403);
-        if (req.method==="PUT" && u.pathname==="/api/upload") return await uploaded(root,db,req,u);
-        if (req.method!=="POST") return error("Not found",404);
-        const data=await parseJSON(req);
-        if(u.pathname==="/api/add") {
-          const sources=Array.isArray(data.sources)?data.sources.filter(s=>typeof s==="string").slice(0,30) as string[]:[];
-          if(!sources.length) return error("Paste at least one URL");
-          const flags=new Map<string,string[]>();
-          const note=str(data.note,1500),project=str(data.project,100);
-          if(note)flags.set("note",[note]);if(project)flags.set("project",[project]);
-          const results=[];
-          for(const source of sources) {
-            if (!/^https?:\/\//i.test(source)) throw new Error("Only website URLs can be pasted here. Drop images to upload.");
-            results.push(await addOne(root,db,source,{cmd:"add",args:[source],flags}));
-          }
-          return json({items:results});
-        }
-        if(u.pathname==="/api/note") {
-          const id=str(data.id,30), note=str(data.note,1500);
-          if(!note) return error("Write a short note first");
-          const ref=getItem(db,"refs",id);
-          if(!ref.notes.some(n=>n.text===note)) {
-            ref.notes.push({text:note,added_at:now()});ref.updated_at=now();
-            inTransaction(db,()=>{saveRecord(db,"refs",ref);refreshSearch(db,id);});
-          }
-          return json({saved:true});
-        }
-        if(u.pathname==="/api/feedback") {
-          const id=str(data.id,30),vote=str(data.vote,16),text=str(data.text,500);
-          getItem(db,"refs",id);
-          if(!["like","dislike"].includes(vote)||!text) return error("Choose like or dislike and say what specifically");
-          const feedback:Feedback={id:itemId("fb"),ref_id:id,vote:vote as Feedback["vote"],aspect:text.slice(0,160),quote:text,reason:"",project:null,created_at:now()};
-          inTransaction(db,()=>{saveRecord(db,"feedback",feedback);refreshSearch(db,id);});
-          return json({saved:true,id:feedback.id});
-        }
-        if(u.pathname==="/api/preference") {
-          const rule=str(data.rule,500),kind=str(data.kind,10),project=str(data.project,100);
-          if(!rule||!["prefer","avoid"].includes(kind)) return error("Enter a preference and choose Prefer or Avoid");
-          const p:Preference={id:itemId("pref"),kind:kind as Preference["kind"],rule,
-            scope:project?"project":"global",project:project||null,feedback_ids:[],statement:rule,created_at:now()};
-          inTransaction(db,()=>saveRecord(db,"preferences",p));
-          return json({saved:true,id:p.id});
-        }
-        if(u.pathname==="/api/retire") {
-          const id=str(data.id,30);getItem(db,"preferences",id);
-          inTransaction(db,()=>db.query("INSERT OR IGNORE INTO retired (preference_id,data) VALUES (?,?)").run(id,JSON.stringify({preference_id:id,reason:"Retired in Taste workspace",retired_at:now()})));
-          return json({retired:true});
-        }
-        return error("Not found",404);
-      } catch(e) {return error(e instanceof Error?e.message:String(e));}
+      try { return await routeRequest(ctx,req); }
+      catch(e) { return error(e instanceof Error?e.message:String(e)); }
     },
   });
   const address=`http://127.0.0.1:${server.port}`;

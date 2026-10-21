@@ -1,5 +1,4 @@
 #!/usr/bin/env bun
-/** Local-first Design Memory CLI. Bun + TypeScript + built-in SQLite. No npm packages. */
 import { Database } from "bun:sqlite";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
@@ -57,31 +56,35 @@ const FLAGS: Record<string, Set<string>> = {
 };
 
 type Arguments = { cmd: string; args: string[]; flags: Map<string,string[]>; root?: string };
+const HELP_WORDS = new Set(["--help", "-h"]);
+function nextValue(argv: string[], index: number, message: string, allowEmpty = true): string {
+  const value = argv[index + 1];
+  const missing = value === undefined || value.startsWith("--") || (!allowEmpty && !value);
+  if (missing) throw new Error(message);
+  return value!;
+}
+function checkFlag(parsed: Arguments, key: string): void {
+  if (!parsed.cmd) throw new Error(`Specify a command before --${key}`);
+  if (!FLAGS[parsed.cmd]?.has(key)) throw new Error(`Unknown flag --${key} for ${parsed.cmd}`);
+}
+function takeWord(parsed: Arguments, word: string): void {
+  if (parsed.cmd) { parsed.args.push(word); return; }
+  if (!VALID.has(word)) throw new Error(`Unknown command: ${word}\n${USAGE}`);
+  parsed.cmd = word;
+}
 function parseArgs(argv: string[]): Arguments {
-  let root: string | undefined;
-  const flags = new Map<string,string[]>();
-  const args: string[] = [];
-  let cmd = "";
+  const parsed: Arguments = { cmd: "", args: [], flags: new Map<string,string[]>() };
   for (let i = 0; i < argv.length; ++i) {
     const word = argv[i]!;
-    if (word === "--help" || word === "-h") return { cmd: "help", args: [], flags };
-    if (word === "--root") {
-      root = argv[++i];
-      if (!root || root.startsWith("--")) throw new Error("--root requires a path");
-    } else if (word.startsWith("--")) {
+    if (HELP_WORDS.has(word)) return { cmd: "help", args: [], flags: parsed.flags };
+    if (word === "--root") parsed.root = nextValue(argv, i++, "--root requires a path", false);
+    else if (word.startsWith("--")) {
       const key = word.slice(2);
-      if (!cmd) throw new Error(`Specify a command before --${key}`);
-      if (!FLAGS[cmd]?.has(key)) throw new Error(`Unknown flag --${key} for ${cmd}`);
-      const value = argv[++i];
-      if (value === undefined || value.startsWith("--")) throw new Error(`--${key} requires a value`);
-      flags.set(key, [...(flags.get(key) ?? []), value]);
-    } else if (!cmd) {
-      cmd = word;
-      if (!VALID.has(cmd)) throw new Error(`Unknown command: ${cmd}\n${USAGE}`);
-    } else args.push(word);
+      checkFlag(parsed, key);
+      parsed.flags.set(key, [...(parsed.flags.get(key) ?? []), nextValue(argv, i++, `--${key} requires a value`)]);
+    } else takeWord(parsed, word);
   }
-  if (!cmd) return { cmd: "help", args: [], flags };
-  return { cmd, args, flags, root };
+  return parsed.cmd ? parsed : { cmd: "help", args: [], flags: parsed.flags };
 }
 const arg = (a: Arguments, name: string) => a.flags.get(name)?.at(-1);
 const all = (a: Arguments, name: string) => a.flags.get(name) ?? [];
@@ -114,51 +117,62 @@ const postTitle = (post: XPost) => {
   return `@${post.author}: ${line.length > TITLE_TEXT_LIMIT ? line.slice(0, TITLE_TEXT_LIMIT - 1).trimEnd() + "…" : line}`;
 };
 
-export async function addOne(root: string, db: Database, source: string, args: Arguments, uploaded?: Media): Promise<unknown> {
-  source = source.trim();
-  const isURL = source.startsWith("http://") || source.startsWith("https://");
-  let kind: Kind, title: string, media: Media | undefined;
-  let origin: Reference["source"];
-  if (isURL) {
+const KINDS = ["screenshot","website","shadcn","x"] as const;
+type SourceInfo = { kind: Kind; title: string; origin: Reference["source"]; media?: Media };
+
+async function describeSource(root: string, source: string, uploaded?: Media): Promise<SourceInfo> {
+  if (source.startsWith("http://") || source.startsWith("https://")) {
     const d = urlDetails(source);
-    kind = d.kind; title = d.title;
-    origin = { type: "url", value: source, key: d.key };
-  } else {
-    media = uploaded ?? await addMedia(root, source);
-    kind = "screenshot"; title = media.original_filename;
-    origin = { type: "file", value: uploaded ? join(root, media.path) : expand(source), key: media.sha256 };
+    return { kind: d.kind, title: d.title, origin: { type: "url", value: source, key: d.key } };
   }
-  kind = choose(arg(args, "kind"), ["screenshot","website","shadcn","x"] as const, "kind", kind);
-  const old = db.query("SELECT data FROM refs WHERE source_key=?").get(origin.key) as { data:string } | null;
-  const existing = !!old;
-  const name = arg(args, "title");
+  const media = uploaded ?? await addMedia(root, source);
+  const value = uploaded ? join(root, media.path) : expand(source);
+  return { kind: "screenshot", title: media.original_filename, media, origin: { type: "file", value, key: media.sha256 } };
+}
+function loadOrCreateRef(db: Database, info: SourceInfo, kind: Kind, name: string | undefined): { ref: Reference; existing: boolean } {
+  const old = db.query("SELECT data FROM refs WHERE source_key=?").get(info.origin.key) as { data:string } | null;
   const ref: Reference = old ? JSON.parse(old.data) : {
-    id: itemId("ref"), kind, title: name ?? title, source: origin, media: [], notes: [], tags: [], projects: [], created_at: now(),
+    id: itemId("ref"), kind, title: name ?? info.title, source: info.origin, media: [], notes: [], tags: [], projects: [], created_at: now(),
   };
   if (name) ref.title = name;
-  const attached = arg(args, "image") ? await addMedia(root, arg(args, "image")!) : undefined;
-  for (const m of [media, attached]) {
+  return { ref, existing: !!old };
+}
+function mergeMedia(ref: Reference, items: Array<Media | undefined>): void {
+  for (const m of items) {
     if (!m) continue;
     const previous = ref.media.find(prior => prior.sha256 === m.sha256);
     if (!previous) ref.media.push(m);
     else if (m.thumbnail) previous.thumbnail = m.thumbnail;
   }
-  const warnings: string[] = [];
+}
+async function attachXPost(root: string, ref: Reference, args: Arguments, name: string | undefined): Promise<string[]> {
   const fetchPost = choose(arg(args, "fetch"), ["yes", "no"] as const, "fetch", "yes") === "yes";
-  if (ref.kind === "x" && fetchPost && !ref.post) {
-    try {
-      const fetched = await ingestXPost(root, ref.source.key);
-      ref.post = fetched.post;
-      warnings.push(...fetched.warnings);
-      for (const m of fetched.media) if (!ref.media.some(prior => prior.sha256 === m.sha256)) ref.media.push(m);
-      if (!name && fetched.post.text) ref.title = postTitle(fetched.post);
-    } catch (cause) { warnings.push(`Saved the link only. Could not fetch the X post: ${(cause as Error).message}`); }
+  if (ref.kind !== "x" || !fetchPost || ref.post) return [];
+  try {
+    const fetched = await ingestXPost(root, ref.source.key);
+    ref.post = fetched.post;
+    mergeMedia(ref, fetched.media);
+    if (!name && fetched.post.text) ref.title = postTitle(fetched.post);
+    return fetched.warnings;
+  } catch (cause) {
+    return [`Saved the link only. Could not fetch the X post: ${(cause as Error).message}`];
   }
+}
+function applyUserFields(ref: Reference, args: Arguments): void {
   const note = arg(args, "note");
   if (note && !ref.notes.some(entry => entry.text === note)) ref.notes.push({ text: note, added_at: now() });
   ref.tags = [...new Set([...ref.tags, ...cleanTags(all(args, "tag"))])];
   const project = arg(args, "project");
   if (project && !ref.projects.includes(project)) ref.projects.push(project);
+}
+export async function addOne(root: string, db: Database, source: string, args: Arguments, uploaded?: Media): Promise<unknown> {
+  const info = await describeSource(root, source.trim(), uploaded);
+  const name = arg(args, "title");
+  const { ref, existing } = loadOrCreateRef(db, info, choose(arg(args, "kind"), KINDS, "kind", info.kind), name);
+  const image = arg(args, "image");
+  mergeMedia(ref, [info.media, image ? await addMedia(root, image) : undefined]);
+  const warnings = await attachXPost(root, ref, args, name);
+  applyUserFields(ref, args);
   ref.updated_at = now();
   inTransaction(db, () => { saveRecord(db, "refs", ref); refreshSearch(db, ref.id); });
   return { id: ref.id, kind: ref.kind, duplicate: existing, title: ref.title, media: ref.media.map(m => m.path),
@@ -184,7 +198,6 @@ function* iterMatches(db: Database, a: Arguments): Generator<Reference> {
   let useFts = false;
   if (text && terms.length && ensureFts(db)) {
     useFts = true;
-    // Quoted Unicode word tokens and prefix matching; never interpolate user query into SQL.
     clauses.push("refs_fts MATCH ?");
     params.push(terms.map(term => `"${term.replaceAll('"', '')}"*`).join(" AND "));
   } else if (text) {
@@ -316,34 +329,36 @@ function topBriefReferences(db: Database, topic: string, project: string | undef
   const params = [...(project ? [project] : []), ...words, limit];
   return (db.query(sql).all(...params) as { data: string }[]).map(row => JSON.parse(row.data) as Reference);
 }
+const flatten = (text: string) => text.replace(/\s+/g, " ");
+function briefReferenceLines(db: Database, root: string, ref: Reference, project: string | undefined): string[] {
+  const lines = [`### ${ref.title} (${ref.id})`, `- Type: ${ref.kind}`, `- Original: ${ref.source.value}`];
+  for (const media of ref.media) lines.push(`- Local image: \`${join(root, media.path)}\``);
+  if (ref.post) lines.push(`- Post by @${ref.post.author}: ${flatten(ref.post.text)}`);
+  if (ref.post?.quoted) lines.push(`- Quoted post by @${ref.post.quoted.author}: ${flatten(ref.post.quoted.text)}`);
+  for (const note of ref.notes) lines.push(`- User note: ${note.text}`);
+  for (const ob of records(db, "observations", ref.id)) {
+    lines.push(`- Observation (${ob.certainty}, ${ob.aspect}): ${ob.detail} | Evidence: ${ob.evidence}${ob.effect ? ` | Effect: ${ob.effect}` : ""}`);
+  }
+  for (const fb of records(db, "feedback", ref.id)) {
+    const applies = !project || !fb.project || fb.project === project;
+    if (applies) lines.push(`- Explicit feedback (${fb.vote}, ${fb.aspect}): ${fb.reason || fb.quote}`);
+  }
+  lines.push("");
+  return lines;
+}
+const BRIEF_FOOTER = ["## Build and review","","1. Follow product constraints first; select only relevant design ideas.",
+  "2. Translate observations into concrete hierarchy, density, spacing, states, and components.",
+  "3. Do not infer approval of an entire reference from a single liked element.",
+  "4. Inspect the implemented UI and ask for specific keep/reject feedback. Save the answer."];
 function brief(db: Database, root: string, a: Arguments): string {
   const project = arg(a,"project"), topic = arg(a,"topic") ?? "";
   const refIds = all(a,"ref");
-  const limit = positiveInt(arg(a,"limit"),8,30);
-  let selected: Reference[] = [];
-  if (refIds.length) selected = refIds.map(id => getItem(db,"refs",id));
-  else {
-    selected = topBriefReferences(db, topic, project, limit);
-  }
+  const selected = refIds.length ? refIds.map(id => getItem(db,"refs",id)) : topBriefReferences(db, topic, project, positiveInt(arg(a,"limit"),8,30));
   const lines = ["# Design brief", "", `Project: ${project ?? "unspecified"}`, `Focus: ${topic || "unspecified"}`,"",
     "Use this as evidence, not a template to copy. Observe the actual visual before making claims.","",profile(db,project).trim(),"","## Relevant references",""];
   if (!selected.length) lines.push("_No matching references._");
-  for (const ref of selected) {
-    lines.push(`### ${ref.title} (${ref.id})`,`- Type: ${ref.kind}`,`- Original: ${ref.source.value}`);
-    for (const media of ref.media) lines.push(`- Local image: \`${join(root,media.path)}\``);
-    if (ref.post) lines.push(`- Post by @${ref.post.author}: ${ref.post.text.replace(/\s+/g, " ")}`);
-    if (ref.post?.quoted) lines.push(`- Quoted post by @${ref.post.quoted.author}: ${ref.post.quoted.text.replace(/\s+/g, " ")}`);
-    for (const note of ref.notes) lines.push(`- User note: ${note.text}`);
-    for (const ob of records(db,"observations",ref.id)) lines.push(`- Observation (${ob.certainty}, ${ob.aspect}): ${ob.detail} | Evidence: ${ob.evidence}${ob.effect ? ` | Effect: ${ob.effect}` : ""}`);
-    for (const fb of records(db,"feedback",ref.id)) {
-      if (!project || !fb.project || fb.project === project) lines.push(`- Explicit feedback (${fb.vote}, ${fb.aspect}): ${fb.reason || fb.quote}`);
-    }
-    lines.push("");
-  }
-  lines.push("## Build and review","","1. Follow product constraints first; select only relevant design ideas.",
-    "2. Translate observations into concrete hierarchy, density, spacing, states, and components.",
-    "3. Do not infer approval of an entire reference from a single liked element.",
-    "4. Inspect the implemented UI and ask for specific keep/reject feedback. Save the answer.");
+  for (const ref of selected) lines.push(...briefReferenceLines(db, root, ref, project));
+  lines.push(...BRIEF_FOOTER);
   return lines.join("\n").trim()+"\n";
 }
 function cmdBrief(root:string,db:Database,a:Arguments) { writeOrPrint(brief(db,root,a),arg(a,"output")); }
@@ -361,6 +376,46 @@ async function cmdService(root:string,a:Arguments) {
   return await service.serviceStatus(root);
 }
 
+type CommandContext = { root: string; db: Database; a: Arguments };
+function parsePort(value: string | undefined): number {
+  const port = value === undefined ? 0 : Number(value);
+  if (!Number.isSafeInteger(port) || port < 0 || port > 65535) throw new Error("--port must be between 0 and 65535");
+  return port;
+}
+async function cmdOpen({ root, db, a }: CommandContext): Promise<void> {
+  const { startApp, launchBrowser } = await import("./app.ts");
+  const portValue = arg(a,"port");
+  const openBrowser = choose(arg(a,"browser"),["yes","no"] as const,"browser","yes") === "yes";
+  const running = portValue === undefined ? await (await import("./service.ts")).runningServiceUrl(root) : undefined;
+  if (running) {
+    console.log(`Taste workspace (background service): ${running}`);
+    if (openBrowser) launchBrowser(running);
+    return;
+  }
+  const server = startApp(root, db, { port: parsePort(portValue), launch: openBrowser });
+  await new Promise<void>(resolve => {
+    const shutdown = () => { server.stop(true); resolve(); };
+    process.once("SIGINT", shutdown);
+    process.once("SIGTERM", shutdown);
+  });
+}
+const COMMANDS: Record<string, (c: CommandContext) => unknown> = {
+  add: c => cmdAdd(c.root, c.db, c.a),
+  list: c => cmdList(c.db, c.a),
+  search: c => cmdList(c.db, c.a),
+  show: c => cmdShow(c.db, c.a),
+  observe: c => cmdObserve(c.db, c.a),
+  feedback: c => cmdFeedback(c.db, c.a),
+  prefer: c => cmdPrefer(c.db, c.a),
+  retire: c => cmdRetire(c.db, c.a),
+  candidates: c => cmdCandidates(c.db, c.a),
+  profile: c => cmdProfile(c.db, c.a),
+  brief: c => cmdBrief(c.root, c.db, c.a),
+  gallery: async c => emit(await generateGallery(c.db, c.root, arg(c.a, "output"))),
+  open: cmdOpen,
+  service: async c => emit(await cmdService(c.root, c.a)),
+};
+
 export async function main(argv:string[]=process.argv.slice(2)):Promise<number> {
   let db:Database | undefined;
   try {
@@ -368,40 +423,7 @@ export async function main(argv:string[]=process.argv.slice(2)):Promise<number> 
     if (a.cmd === "help") { console.log(USAGE); return 0; }
     const root = rootPath(a.root);
     db = store(root);
-    switch(a.cmd) {
-      case "add": await cmdAdd(root,db,a);break;
-      case "list": case "search": cmdList(db,a);break;
-      case "show": cmdShow(db,a);break;
-      case "observe": cmdObserve(db,a);break;
-      case "feedback": cmdFeedback(db,a);break;
-      case "prefer": cmdPrefer(db,a);break;
-      case "retire": cmdRetire(db,a);break;
-      case "candidates": cmdCandidates(db,a);break;
-      case "profile": cmdProfile(db,a);break;
-      case "brief": cmdBrief(root,db,a);break;
-      case "gallery": emit(await generateGallery(db,root,arg(a,"output")));break;
-      case "open": {
-        const {startApp,launchBrowser} = await import("./app.ts"); // No UI code loaded by add/search/brief.
-        const portValue = arg(a,"port");
-        const running = portValue===undefined ? await (await import("./service.ts")).runningServiceUrl(root) : undefined;
-        if (running) {
-          console.log(`Taste workspace (background service): ${running}`);
-          if (choose(arg(a,"browser"),["yes","no"] as const,"browser","yes")==="yes") launchBrowser(running);
-          break;
-        }
-        const port = portValue===undefined ? 0 : Number(portValue);
-        if (!Number.isSafeInteger(port) || port < 0 || port > 65535) throw new Error("--port must be between 0 and 65535");
-        const browser=choose(arg(a,"browser"),["yes","no"] as const,"browser","yes");
-        const server=startApp(root,db,{port,launch:browser==="yes"});
-        await new Promise<void>(resolve=>{
-          const shutdown=()=>{server.stop(true);resolve();};
-          process.once("SIGINT",shutdown);
-          process.once("SIGTERM",shutdown);
-        });
-        break;
-      }
-      case "service": emit(await cmdService(root,a));break;
-    }
+    await COMMANDS[a.cmd]?.({ root, db, a });
     return 0;
   } catch (error) {
     console.error(`design-memory: ${error instanceof Error ? error.message : String(error)}`);

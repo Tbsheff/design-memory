@@ -1,5 +1,3 @@
-// Generated from v0.2 gallery markup; Bun/TypeScript owns rendering.
-// Escaping of dynamic values is performed in gallery.ts, not in this template.
 import { rawHTML } from "./raw-html.ts";
 import { faviconLink, logoSVG } from "./logo.ts";
 export const safeJS = (value: string): string => JSON.stringify(value).replace(/</g, "\\u003c").replace(/>/g, "\\u003e").replace(/&/g, "\\u0026");

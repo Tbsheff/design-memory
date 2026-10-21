@@ -9,15 +9,11 @@ if ! command -v bun >/dev/null 2>&1; then
 fi
 
 mkdir -p "$core" "$HOME/.agents/skills" "$HOME/.claude/skills"
-# The runtime remains at the original location to preserve existing CLI paths.
-# Reference data lives separately at ~/.design-memory and is never overwritten.
-if [[ "$src" != "$core" ]]; then
+if [[ "$src" != "$(cd "$core" && pwd -P)" ]]; then
   cp -R "$src/README.md" "$src/install.sh" "$src/LICENSE" \
     "$src/package.json" "$src/scripts" "$src/src" "$src/references" "$src/desktop" "$core/"
 fi
 
-# Retire the legacy combined skill without deleting its CLI or user changes.
-# It would otherwise compete with the two specialized skills during discovery.
 legacy="$core/SKILL.md"
 if [[ -f "$legacy" ]] && grep -q '^name: design-memory$' "$legacy"; then
   if [[ ! -e "$core/SKILL.md.legacy" ]]; then
@@ -30,8 +26,6 @@ elif [[ -f "$legacy" ]]; then
   echo "A custom combined skill still exists at $legacy; review it for duplicate triggers."
 fi
 
-# Keep install templates in a non-skill directory for reinstalling from the runtime.
-# Only ~/.agents/skills/taste-{add,use}/SKILL.md are discoverable skill manifests.
 mkdir -p "$core/skill-definitions"
 for name in taste-add taste-use; do
   if [[ -f "$src/skills/$name/SKILL.md" ]]; then
@@ -60,7 +54,6 @@ for name in taste-add taste-use; do
   echo "Installed: $name -> $destination"
 done
 
-# Optional short command; the full skill path always works regardless of PATH.
 mkdir -p "$HOME/.local/bin"
 short_wrapper="$HOME/.local/bin/taste"
 if [[ -L "$short_wrapper" && "$(readlink "$short_wrapper")" == "$core/scripts/taste" ]]; then

@@ -10,34 +10,47 @@ import { expand } from "./db.ts";
 const IMAGE_EXTS = new Set([".png", ".jpg", ".jpeg", ".webp", ".gif", ".avif"]);
 const TRACKING = new Set(["fbclid", "gclid", "igshid", "ref_src", "s", "t", "si"]);
 
-export function urlDetails(source: string): { kind: Kind; key: string; title: string } {
-  let url: URL;
-  try { url = new URL(source); } catch { throw new Error("Use a valid http(s) URL or a local image file"); }
-  if (!["http:", "https:"].includes(url.protocol) || !url.hostname || url.username || url.password) {
-    throw new Error("Use a valid http(s) URL without embedded credentials or a local image file");
-  }
-  let host = url.hostname.toLowerCase().replace(/^www\./, "");
-  const path = url.pathname.replace(/\/+$/, "") || "/";
+const X_HOSTS = new Set(["x.com", "twitter.com", "mobile.twitter.com"]);
+const X_STATUS_PATH = /\/status\/\d+/;
+
+function parseHttpUrl(source: string): URL {
+  if (!URL.canParse(source)) throw new Error("Use a valid http(s) URL or a local image file");
+  const url = new URL(source);
+  const unsafe = !["http:", "https:"].includes(url.protocol) || !url.hostname || url.username || url.password;
+  if (unsafe) throw new Error("Use a valid http(s) URL without embedded credentials or a local image file");
+  return url;
+}
+function stripTracking(url: URL): void {
   for (const name of [...url.searchParams.keys()]) {
     const key = name.toLowerCase();
     if (TRACKING.has(key) || key.startsWith("utm_")) url.searchParams.delete(name);
   }
-  let kind: Kind;
-  if (["x.com", "twitter.com", "mobile.twitter.com"].includes(host) && /\/status\/\d+/.test(path)) {
-    kind = "x"; host = "x.com"; url.search = "";
-  } else if (host === "ui.shadcn.com" || host.endsWith(".shadcn.com") || host.includes("shadcn")) kind = "shadcn";
-  else kind = "website";
-  const key = `https://${host}${path}${url.search}`;
-  let title = host + (path === "/" ? "" : ` / ${path.split("/").filter(Boolean).at(-1)}`);
-  if (kind === "x") title = `X post by @${path.match(/\/([^/]+)\/status\/\d+/)?.[1] ?? "unknown"}`;
-  if (kind === "shadcn") title = `shadcn — ${(path.split("/").filter(Boolean).at(-1) ?? "component").replaceAll("-", " ")}`;
-  return { kind, key, title };
+}
+function classifyUrl(host: string, path: string): Kind {
+  if (X_HOSTS.has(host) && X_STATUS_PATH.test(path)) return "x";
+  return host.includes("shadcn") ? "shadcn" : "website";
+}
+const lastSegment = (path: string) => path.split("/").filter(Boolean).at(-1);
+function urlTitle(kind: Kind, host: string, path: string): string {
+  if (kind === "x") return `X post by @${path.match(/\/([^/]+)\/status\/\d+/)?.[1] ?? "unknown"}`;
+  if (kind === "shadcn") return `shadcn — ${(lastSegment(path) ?? "component").replaceAll("-", " ")}`;
+  return host + (path === "/" ? "" : ` / ${lastSegment(path)}`);
+}
+export function urlDetails(source: string): { kind: Kind; key: string; title: string } {
+  const url = parseHttpUrl(source);
+  const path = url.pathname.replace(/\/+$/, "") || "/";
+  stripTracking(url);
+  const kind = classifyUrl(url.hostname.toLowerCase().replace(/^www\./, ""), path);
+  const host = kind === "x" ? "x.com" : url.hostname.toLowerCase().replace(/^www\./, "");
+  if (kind === "x") url.search = "";
+  return { kind, key: `https://${host}${path}${url.search}`, title: urlTitle(kind, host, path) };
 }
 
 function commandExists(name: string): boolean {
   const path = process.env.PATH ?? "";
   for (const dir of path.split(":")) {
-    try { if (statSync(join(dir, name)).isFile()) return true; } catch { /* not present */ }
+    const candidate = join(dir, name);
+    if (existsSync(candidate) && statSync(candidate).isFile()) return true;
   }
   return false;
 }
@@ -66,7 +79,6 @@ function thumbnail(source: string, target: string): boolean {
   finally { if (existsSync(temp)) unlinkSync(temp); }
 }
 
-/** Commit a streamed upload without rereading/copying the image. */
 export function finalizeUploadedMedia(root: string, tmp: string, sha256: string, filename: string): Media {
   const extension=extname(filename).toLowerCase();
   if (!IMAGE_EXTS.has(extension) || !/^[a-f0-9]{64}$/.test(sha256)) throw new Error("Invalid image upload");
@@ -80,7 +92,6 @@ export function finalizeUploadedMedia(root: string, tmp: string, sha256: string,
   return media;
 }
 
-/** Hash and copy in streams: no original image buffers retained in Bun heap. */
 export async function addMedia(root: string, file: string): Promise<Media> {
   const source = expand(file);
   const extension = extname(source).toLowerCase();
@@ -96,7 +107,6 @@ export async function addMedia(root: string, file: string): Promise<Media> {
     const tmp = `${destination}.${randomBytes(4).toString("hex")}.tmp`;
     try {
       await pipeline(createReadStream(source, { highWaterMark: 1024 * 1024 }), createWriteStream(tmp, { flags: "wx" }));
-      // Replace is atomic on same filesystem. Originals can be deleted after ingestion.
       renameSync(tmp, destination);
     } finally { if (existsSync(tmp)) unlinkSync(tmp); }
   }

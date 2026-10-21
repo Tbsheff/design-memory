@@ -60,7 +60,6 @@ export function store(root: string): Database {
   mkdirSync(root, { recursive: true });
   const db = new Database(join(root, "library.sqlite3"));
   try {
-    // Small bounded SQLite cache, no mapping the database into process memory.
     db.run("PRAGMA cache_size=-1024");
     db.run("PRAGMA temp_store=FILE");
     db.run("PRAGMA mmap_size=0");
@@ -148,8 +147,7 @@ function migrateLegacy(root: string, db: Database): void {
         db.query("INSERT OR REPLACE INTO retired(preference_id,data) VALUES(?,?)").run(r.preference_id, encode(r));
       }
     }
-    // Only legacy libraries require rebuilding existing searchable descriptions.
-    if (existsSync(join(root, "refs"))) {
+        if (existsSync(join(root, "refs"))) {
       for (const row of db.query("SELECT id FROM refs").iterate() as Iterable<{id:string}>) refreshSearch(db, row.id);
     }
     db.query("INSERT OR REPLACE INTO meta(key,value) VALUES('legacy_imported','yes')").run();
@@ -160,7 +158,6 @@ function hasFts(db: Database): boolean {
   return !!db.query("SELECT 1 FROM sqlite_master WHERE type='table' AND name='refs_fts'").get();
 }
 
-/** Lazy index: builds only on first search, and automatically populates an existing v0.2 library. */
 export function ensureFts(db: Database): boolean {
   if (hasFts(db)) return true;
   try {
@@ -170,7 +167,6 @@ export function ensureFts(db: Database): boolean {
     });
     return true;
   } catch {
-    // FTS5 not enabled in this SQLite build: retain substring-search fallback.
     return false;
   }
 }

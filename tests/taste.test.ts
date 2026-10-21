@@ -8,7 +8,6 @@ import { encode, inTransaction, itemId, now, refreshSearch, saveRecord, store } 
 import type { Reference } from "../src/db.ts";
 
 const cli = resolve(import.meta.dir, "../src/main.ts");
-// A tiny valid PNG for testing zero-copy media handling without a graphics library.
 const PNG = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+XnncAAAAASUVORK5CYII=", "base64");
 process.env.TASTE_X_SYNDICATION_URL = "http://127.0.0.1:9/tweet-result";
 let temp = "", root = "", image = "";
@@ -32,7 +31,6 @@ function run(...args:string[]):any {
 }
 function add(url="https://example.com/dashboard", ...opts:string[]):string { return run("add",url,...opts).id; }
 
-// These tests invoke a fresh Bun process for every command and exercise actual persisted data.
 describe("reference inbox", () => {
   test("screenshot originals survive deletion of the source", () => {
     const saved = run("add",image,"--note","Dense layout","--tag","tables");
