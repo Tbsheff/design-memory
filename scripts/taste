@@ -1,0 +1,8 @@
+#!/bin/sh
+# Bun runs TypeScript natively. Nothing remains running after the command.
+HERE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+if ! command -v bun >/dev/null 2>&1; then
+  echo 'design-memory: Bun is required. Install from https://bun.com/docs/installation' >&2
+  exit 127
+fi
+exec bun "$HERE/../src/main.ts" "$@"

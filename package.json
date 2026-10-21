@@ -1,0 +1,12 @@
+{
+  "name": "design-memory",
+  "version": "0.5.0",
+  "private": true,
+  "description": "Local-first taste library with two agent skills and an on-demand visual workspace",
+  "type": "module",
+  "scripts": {
+    "taste": "bun src/main.ts",
+    "test": "bun test"
+  },
+  "engines": { "bun": ">=1.3" }
+}
