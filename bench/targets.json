@@ -1,0 +1,74 @@
+[
+  {
+    "id": "usage-dashboard-dark",
+    "image": "targets/usage-dashboard-dark.jpg",
+    "source_url": "https://x.com/Karthik_designs/status/2108558098545737786",
+    "author": "Karthik_designs",
+    "prompt": "Build a dark usage dashboard for an AI agent platform: a filter row, a KPI row (spend, runs, tokens, success rate, time saved), a stacked daily spend chart by model, and a tabbed per-model usage table.",
+    "width": 2048,
+    "height": 1614
+  },
+  {
+    "id": "mrr-metrics-light",
+    "image": "targets/mrr-metrics-light.jpg",
+    "source_url": "https://x.com/ikramhsakib/status/2112421708028424562",
+    "author": "ikramhsakib",
+    "prompt": "Build the Metrics page of a light SaaS revenue analytics app: sidebar navigation, MRR, churn and failed-payment KPI cards, a monthly MRR bar chart with a revenue-movement summary beside it, and a filterable table of customer revenue movements.",
+    "width": 2048,
+    "height": 1321
+  },
+  {
+    "id": "connect-source-light",
+    "image": "targets/connect-source-light.jpg",
+    "source_url": "https://x.com/ikramhsakib/status/2111967239540998459",
+    "author": "ikramhsakib",
+    "prompt": "Build the Connect page of a light revenue analytics app where a user links a billing source: sidebar navigation, a connector search, All / Not connected / Connected tabs, and a connected Stripe card with record counts, a read-only note, sync history and data health.",
+    "width": 2048,
+    "height": 1321
+  },
+  {
+    "id": "invoice-exception-detail",
+    "image": "targets/invoice-exception-detail.jpg",
+    "source_url": "https://x.com/nizamdesign/status/2112846370121846940",
+    "author": "nizamdesign",
+    "prompt": "Build an accounts-payable exception detail page for a VAT number mismatch on a supplier invoice: sidebar navigation, a status strip, an evidence card comparing the invoice VAT number with the verified record, an explanation, resolution options, and a side panel with priority reasons and supplier details.",
+    "width": 2048,
+    "height": 1536
+  },
+  {
+    "id": "client-detail-light",
+    "image": "targets/client-detail-light.jpg",
+    "source_url": "https://x.com/nizamdesign/status/2113042658075545873",
+    "author": "nizamdesign",
+    "prompt": "Build a client detail page for an AI advisory platform: sidebar navigation, a current-objective card with plan progress and three metrics, recent activity, open items that need action, and an account panel with plan, seats, AI usage and team.",
+    "width": 2048,
+    "height": 1536
+  },
+  {
+    "id": "customer-table-dark",
+    "image": "targets/customer-table-dark.jpg",
+    "source_url": "https://x.com/sterlynavneet/status/2112982249956413563",
+    "author": "sterlynavneet",
+    "prompt": "Build a dark sales admin Customers page: sidebar with a Sales section, a row of five KPI cards, filter chips with table actions, a 13-row customer quotations table with priority and status, and pagination.",
+    "width": 2048,
+    "height": 1426
+  },
+  {
+    "id": "agent-runs-dark",
+    "image": "targets/agent-runs-dark.jpg",
+    "source_url": "https://x.com/Karthik_designs/status/2112891659507896372",
+    "author": "Karthik_designs",
+    "prompt": "Build a dark Runs tab for one support agent called Escalation Watch: breadcrumb, agent header with status, Overview / Runs / Settings tabs, outcome filter chips with counts, and a list of eight ticket runs with their outcome. Show it zoomed in, cropped to the main content.",
+    "width": 2048,
+    "height": 2048
+  },
+  {
+    "id": "finance-dashboard-light",
+    "image": "targets/finance-dashboard-light.jpg",
+    "source_url": "https://x.com/_heyrico/status/2111857856916201877",
+    "author": "_heyrico",
+    "prompt": "Build a light personal finance dashboard: sidebar navigation with an upgrade card, balance, income and expense cards, a monthly spending bar chart with one month highlighted, a transaction history table, and a right column with a payment card and savings.",
+    "width": 2048,
+    "height": 1536
+  }
+]
