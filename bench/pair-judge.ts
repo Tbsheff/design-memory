@@ -2,7 +2,7 @@ import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { round } from "./lib.ts";
 import type { Target } from "./lib.ts";
-import { autoVote, leftArm, outcomes, pairCalls, pairFile, pairPrompt, parsePairVerdict, summarizePairs } from "./pairwise.ts";
+import { autoVote, leftArm, outcomes, pairCalls, pairFile, pairPrompt, parsePairVerdict, QUESTIONS, summarizePairs } from "./pairwise.ts";
 import type { Arm, CallResult, PairCall, PairOutcome, PairSummary } from "./pairwise.ts";
 import { readJson } from "./resume.ts";
 import { pool } from "./run.ts";
@@ -33,7 +33,7 @@ async function judgeCall(job: PairJob, call: PairCall): Promise<CallResult> {
 async function oneCall(job: PairJob, call: PairCall): Promise<CallResult> {
   const path = join(job.dir, pairFile(call));
   const saved = readJson<CallResult>(path);
-  if (saved && (saved.verdict || saved.auto)) return saved;
+  if (saved && (saved.auto || (saved.verdict && QUESTIONS.every(q => saved.verdict![q])))) return saved;
   const mode = autoVote(buildOk(job.a, call.target, call.sample), buildOk(job.b, call.target, call.sample));
   if (mode === null) return { ...call, cost: 0, error: "both builds failed" };
   const result = mode === "judge" ? await judgeCall(job, call) : { ...call, auto: mode, cost: 0 };

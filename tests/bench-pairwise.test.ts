@@ -1,13 +1,14 @@
 import { describe, expect, test } from "bun:test";
 import { lossReasons } from "../bench/optimize.ts";
+import { attemptsBlock } from "../bench/optimize-feedback.ts";
 import {
   addTotals, autoVote, focusOrder, planRound, combineVotes, decide, DEFAULT_UNITS, EMPTY_TOTALS, holdoutEstimate, isSplit, leftArm, outcomes, pairCalls, pairFile,
   pairPrompt, parsePairVerdict, pickBest, roundEstimate, sideToVote, signTestP, summarizePairs, unitCosts, winStats,
 } from "../bench/pairwise.ts";
 import type { AcceptRule, CallResult, PairSummary, Side, Vote } from "../bench/pairwise.ts";
 
-const verdict = (closer: Side, rules: Side = "tie") => ({ closer, closer_reason: `c-${closer}`, rules, rules_reason: `r-${rules}` });
-const call = (target: string, sample: number, order: "ab" | "ba", closer: Side, rules: Side = "tie"): CallResult => ({ target, sample, order, verdict: verdict(closer, rules), cost: 0.1 });
+const verdict = (closer: Side, rules: Side = "tie", calmer: Side = "tie") => ({ closer, closer_reason: `c-${closer}`, rules, rules_reason: `r-${rules}`, calmer, calmer_reason: `m-${calmer}` });
+const call = (target: string, sample: number, order: "ab" | "ba", closer: Side, rules: Side = "tie", calmer: Side = "tie"): CallResult => ({ target, sample, order, verdict: verdict(closer, rules, calmer), cost: 0.1 });
 
 describe("left/right bookkeeping", () => {
   test("order ab puts the incumbent (a) left, ba puts the candidate (b) left", () => {
@@ -85,11 +86,11 @@ describe("sign test", () => {
 });
 
 describe("acceptance", () => {
-  const rule: AcceptRule = { on: "closer", minWinRate: 0.6, maxP: 0.2, minGuardRate: 0.4 };
+  const rule: AcceptRule = { on: "closer", minWinRate: 0.6, maxP: 0.2, minGuardRate: 0.4, guardLossP: 0 };
   const summary = (cw: number, cl: number, rw: number, rl: number): PairSummary => ({
     closer: winStats([...Array(cw).fill("b"), ...Array(cl).fill("a")]), rules: winStats([...Array(rw).fill("b"), ...Array(rl).fill("a")]),
     pairs: 10, split: { closer: 0, rules: 0 }, judge_errors: 0,
-  });
+  }) as unknown as PairSummary;
 
   test("7 of 10 passes, 6 of 10 fails on p", () => {
     expect(decide(summary(7, 3, 5, 5), rule).accept).toBe(true);
@@ -104,6 +105,35 @@ describe("acceptance", () => {
     expect(decide(summary(0, 0, 3, 0), rule).reason).toContain("no non-tie pairs");
     expect(decide(summary(8, 2, 2, 8), rule).reason).toContain("rules win rate below guard");
     expect(decide(summary(8, 2, 0, 0), rule).accept).toBe(true);
+  });
+
+  test("the guard also rejects a clear loss on the other question", () => {
+    const strict = { ...rule, on: "rules" as const, minGuardRate: 0.45, guardLossP: 0.2 };
+    expect(decide(summary(5, 5, 8, 2), strict).accept).toBe(true);
+    expect(decide(summary(9, 11, 8, 2), strict).accept).toBe(true);
+    const loses = decide(summary(45, 55, 8, 2), strict);
+    expect(loses.accept).toBe(false);
+    expect(loses.reason).toContain("closer loses clearly");
+    expect(decide(summary(4, 6, 8, 2), strict).reason).toContain("below guard 0.45");
+  });
+
+  test("rules-first with closer and calmer floors", () => {
+    const strict: AcceptRule = { on: "rules", minWinRate: 0.6, maxP: 0.2, minGuardRate: 0.45, guardLossP: 0.2, guards: ["closer", "calmer"] };
+    const full = (c: [number, number], r: [number, number], m: [number, number]): PairSummary => ({
+      ...summary(c[0], c[1], r[0], r[1]), calmer: winStats([...Array(m[0]).fill("b"), ...Array(m[1]).fill("a")]), split: { closer: 0, rules: 0, calmer: 0 },
+    });
+    expect(decide(full([7, 7], [10, 3], [6, 6]), strict).accept).toBe(true);
+    const busy = decide(full([10, 3], [10, 3], [3, 10]), strict);
+    expect(busy.accept).toBe(false);
+    expect(busy.reason).toContain("calmer win rate below guard 0.45");
+    expect(busy.reason).toContain("calmer 3-10-0");
+    expect(decide(full([2, 10], [10, 3], [3, 10]), strict).reason).toContain("closer win rate below guard 0.45; calmer win rate below guard 0.45");
+    expect(decide(full([7, 7], [10, 3], [6, 6]), { ...strict, guards: ["closer"] }).reason).not.toContain("calmer");
+  });
+
+  test("a summary from before a question existed skips that guard", () => {
+    const old = summary(7, 3, 8, 2);
+    expect(decide(old, { ...rule, guards: ["rules", "calmer"] }).accept).toBe(true);
   });
 
   test("accept-on rules swaps main and guard", () => {
@@ -128,7 +158,8 @@ describe("acceptance", () => {
 
 describe("pair judge reply", () => {
   test("parses sides and reasons", () => {
-    expect(parsePairVerdict('ok {"closer":"Left","closer_reason":" denser ","rules":"tie","rules_reason":"same"}')).toEqual({ closer: "left", closer_reason: "denser", rules: "tie", rules_reason: "same" });
+    expect(parsePairVerdict('ok {"closer":"Left","closer_reason":" denser ","rules":"tie","rules_reason":"same","calmer":"right","calmer_reason":"fewer badges"}')).toEqual({ closer: "left", closer_reason: "denser", rules: "tie", rules_reason: "same", calmer: "right", calmer_reason: "fewer badges" });
+    expect(() => parsePairVerdict('{"closer":"left","closer_reason":"x","rules":"tie","rules_reason":"y"}')).toThrow("calmer");
   });
 
   test("rejects bad sides and empty reasons", () => {
@@ -171,5 +202,17 @@ describe("budget", () => {
     expect(focusOrder(["a", "b", "c"], 1, 3)).toEqual(["a", "b", "c"]);
     expect(focusOrder(["a", "b", "c"], 2, 2)).toEqual(["b", "c"]);
     expect(focusOrder(["a", "b", "c"], 4, 1)).toEqual(["a"]);
+  });
+});
+
+describe("earlier proposals in feedback", () => {
+  test("only the latest attempts keep their full diff", () => {
+    const a = (i: number) => ({ round: i, focus: "craft", accepted: false, reason: "no", summary: "s", diff: `DIFF-${i}-`, losses: ["closer: x"], source: i < 2 ? "earlier run full-2," : undefined });
+    const text = attemptsBlock(Array.from({ length: 12 }, (_, i) => a(i)));
+    expect(text).not.toContain("DIFF-2-");
+    expect(text).toContain("DIFF-3-");
+    expect(text).toContain("DIFF-11-");
+    expect(text).toContain("### earlier run full-2, Round 0, craft");
+    expect(attemptsBlock([])).toContain("first round");
   });
 });

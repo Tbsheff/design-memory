@@ -3,7 +3,7 @@ import { round } from "./lib.ts";
 import type { ArmScore } from "./objective.ts";
 import type { Attempt } from "./optimize-feedback.ts";
 import { EMPTY_TOTALS } from "./pairwise.ts";
-import type { CostTotals, PairSummary } from "./pairwise.ts";
+import type { CostTotals, PairSummary, Question } from "./pairwise.ts";
 
 export function readJson<T = unknown>(path: string): T | null {
   if (!existsSync(path)) return null;
@@ -40,7 +40,7 @@ export type CandidateRecord = {
   pairs: PairSummary | null; accepted: boolean; reason: string; losses: string[]; cost: CandidateCost;
 };
 export type RoundRecord = {
-  round: number; incumbent_dir: string; incumbent_from: number; incumbent_eval: string; incumbent_score: ArmScore;
+  round: number; questions?: Question[]; change?: string; incumbent_dir: string; incumbent_from: number; incumbent_eval: string; incumbent_score: ArmScore;
   candidates: CandidateRecord[]; promoted: string | null; cost: number; spent_after: number; totals: CostTotals;
 };
 

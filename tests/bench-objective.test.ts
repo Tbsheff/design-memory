@@ -5,7 +5,7 @@ import {
   armSummary, buildObjective, evalScore, lintCandidate, meanSe, objective, parseProfileRules, parseRuleJudgement, prepareHtml,
   rulePass, splitTargets, worstBuilds,
 } from "../bench/objective.ts";
-import { parseOptimizeArgs } from "../bench/optimize.ts";
+import { comparisons, parseOptimizeArgs, roundFocuses } from "../bench/optimize.ts";
 
 const t = (id: string, split?: "train" | "holdout"): Target => ({ id, image: "", source_url: "", author: "a", prompt: "", width: 1, height: 1, split });
 
@@ -134,6 +134,14 @@ describe("candidate lint", () => {
   });
 });
 
+describe("round focuses", () => {
+  test("a seeded focus leads its round and the rotation fills the rest", () => {
+    expect(roundFocuses({ seedFocus: { round: 5, focus: "minimal" } }, 5, 3).map(f => f.id)).toEqual(["minimal", "process", "rules"]);
+    expect(roundFocuses({ seedFocus: { round: 5, focus: "minimal" } }, 6, 3).map(f => f.id)).toEqual(["rules", "craft", "process"]);
+    expect(roundFocuses({ seedFocus: null }, 1, 2).map(f => f.id)).toEqual(["craft", "process"]);
+  });
+});
+
 describe("args", () => {
   test("run accepts --skill-dir", () => {
     expect(parseRunArgs(["--skill-dir", "x"]).skillDir).toBe("x");
@@ -141,10 +149,29 @@ describe("args", () => {
   });
 
   test("optimize defaults and overrides", () => {
-    expect(parseOptimizeArgs([])).toMatchObject({ rounds: 5, samples: 2, budgetUsd: 60, holdoutSamples: 3, candidates: 3, trainTargets: null, accept: { on: "closer", minWinRate: 0.6, maxP: 0.2, minGuardRate: 0.4 } });
+    expect(parseOptimizeArgs([])).toMatchObject({ rounds: 5, samples: 2, budgetUsd: 60, holdoutSamples: 3, candidates: 3, trainTargets: null, accept: { on: "closer", minWinRate: 0.6, maxP: 0.2, minGuardRate: 0.4, guardLossP: 0.2 } });
     expect(parseOptimizeArgs(["--rounds", "1", "--samples", "1", "--candidates", "2", "--train-targets", "a,b", "--accept-on", "rules", "--max-p", "0.1"])).toMatchObject({ rounds: 1, candidates: 2, trainTargets: ["a", "b"], accept: { on: "rules", maxP: 0.1 } });
     expect(() => parseOptimizeArgs(["--bogus", "1"])).toThrow("unknown flag");
     expect(() => parseOptimizeArgs(["--candidates", "4"])).toThrow("at most 3");
     expect(() => parseOptimizeArgs(["--accept-on", "vibes"])).toThrow("--accept-on");
+    expect(parseOptimizeArgs(["--guard-loss-p", "0.1", "--seed-from", "bench/optimize/full-2"])).toMatchObject({ accept: { guardLossP: 0.1 }, seedFrom: "bench/optimize/full-2" });
+    expect(parseOptimizeArgs([]).seedFrom).toBeNull();
+    expect(parseOptimizeArgs(["--accept-on", "rules"]).accept.guards).toEqual(["closer", "calmer"]);
+    expect(parseOptimizeArgs(["--accept-on", "rules", "--guards", "calmer"]).accept.guards).toEqual(["calmer"]);
+    expect(() => parseOptimizeArgs(["--accept-on", "rules", "--guards", "rules"])).toThrow("--guards");
+    expect(parseOptimizeArgs(["--seed-focus", "minimal"]).seedFocus).toEqual({ round: 1, focus: "minimal" });
+    expect(() => parseOptimizeArgs(["--seed-focus", "vibes"])).toThrow("unknown focus");
+  });
+});
+
+describe("holdout comparisons", () => {
+  const arm = (name: string) => ({ name, ref: { out: `/o/${name}`, mode: "taste" }, scores: [] });
+  test("extra arms meet original, baseline and best", () => {
+    const list = comparisons([arm("baseline"), arm("original"), arm("best")], [arm("minimal")], true);
+    expect(list.map(([n, a, b]) => [n, a.name, b.name])).toEqual([
+      ["best_vs_baseline", "baseline", "best"], ["best_vs_original", "original", "best"],
+      ["minimal_vs_original", "original", "minimal"], ["minimal_vs_baseline", "baseline", "minimal"], ["minimal_vs_best", "best", "minimal"],
+    ]);
+    expect(comparisons([arm("baseline"), arm("original"), arm("original")], [], false).map(c => c[0])).toEqual(["best_vs_baseline"]);
   });
 });

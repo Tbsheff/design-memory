@@ -23,6 +23,21 @@ export const FOCUSES: Focus[] = [
   },
 ];
 
+export const MINIMAL_FOCUS: Focus = {
+  id: "minimal", title: "minimal first",
+  text: `Your focus is MINIMAL FIRST, a process change. Make the builder work in this order:
+1. Build the smallest screen that does the job: the app shell, the page title, the one primary view, and the one to three numbers or columns the task needs.
+2. Then add data, columns, filters and badges one at a time, and only when each one earns its place for the task.
+3. Stop before the screen gets busy.
+Before any code, the builder writes its plan, and the plan lists each extra element it considered with an add or skip decision and a short reason. Put this where the builder will follow it on every build, and keep the rest of the skill intact.`,
+};
+
+export function focusById(id: string): Focus {
+  const f = [...FOCUSES, MINIMAL_FOCUS].find(x => x.id === id);
+  if (!f) throw new Error(`unknown focus: ${id}`);
+  return f;
+}
+
 export function proposerPrompt(focus: Focus): string {
   return `You improve a skill for a coding agent. The skill is "taste-use". It tells an agent how to build or review a user interface with the user's saved design taste: a profile of confirmed rules, plus a library of saved reference designs (screenshots) that the user collected.
 
@@ -32,9 +47,15 @@ How we test the skill:
 - A builder agent gets a short product prompt (for example "build a dark usage dashboard with a KPI row and a table") plus "Use my saved design taste (taste-use skill) for this."
 - The builder runs headless. It has Read, Write, Edit, the Skill tool, and Bash limited to the taste CLI read commands (profile, brief, show, list, search). It writes one index.html. It cannot run a browser, so it cannot see its own page.
 - The page is rendered and compared with a target design. The targets come from designers the user follows, so they stand in for the user's taste. The builder never sees the target.
-- Your version and the current skill each build every case. A blind judge sees the target and the two builds side by side and says which one is closer to the target and which one follows the profile rules better. Your version must win clearly to replace the current skill.
+- Your version and the current skill each build every case. A blind judge sees the target and the two builds side by side and says which one is closer to the target and which one follows the profile rules better. Your version must win clearly on one question and must not lose clearly on the other to replace the current skill.
 
 What to change: the skill text itself. The profile and the library are fixed. Do not tell the builder to change the taste data, and do not add a visual system or design tokens to the profile. Saved reference images are a small extra, not the main lever.
+
+Lessons from earlier runs:
+- Strict rule application made builds sparse and open, and they lost closeness. A real product screen needs structure and the content the task asks for. Read a rule such as "hierarchy over boxes" as "fewer nested containers", not as "an empty layout".
+- Then a version won closeness mostly by adding rows, columns and badges, and the user said: "the agent tends to make the interface too busy". The user also said: "start minimal and add data incrementally".
+- So the goal is a calm, focused screen: it applies the rules, it shows what the task needs, and it is dense only where the task needs density. It is not filled with extras. Each extra element (column, badge, filter, chart, accent) must earn its place.
+- A blind judge now also asks which build is calmer and less busy. Your version must win on the rules and must not lose on closeness or on calm.
 
 ${focus.text}
 
@@ -53,7 +74,7 @@ Constraints:
 - Read "Earlier proposals" in the feedback. Do not repeat a rejected change; learn from why it lost.`;
 }
 
-export type Attempt = { round: number; focus: string; accepted: boolean; reason: string; summary: string; diff: string; losses: string[] };
+export type Attempt = { round: number; focus: string; accepted: boolean; reason: string; summary: string; diff: string; losses: string[]; source?: string };
 export type FeedbackEval = { out: string; scores: BuildScore[] };
 export type CaseLabel = Map<string, string>;
 
@@ -78,15 +99,19 @@ function missedRules(scores: BuildScore[]): string[] {
   return [...counts].sort((a, b) => b[1] - a[1]).map(([rule, n]) => `- ${n}/${scores.length} builds miss: ${rule}`);
 }
 
-function attemptBlock(a: Attempt): string {
-  const head = `### Round ${a.round}, ${a.focus}: ${a.accepted ? "PROMOTED" : "NOT PROMOTED"} (${a.reason})`;
-  const losses = a.losses.length ? ["Why the other skill won some pairs (judge reasons):", ...a.losses.slice(0, 12).map(l => `- ${l}`)] : [];
-  const diff = a.accepted ? [] : [`Diff (do not repeat it as is):\n\`\`\`diff\n${a.diff.slice(0, 4000)}\n\`\`\``];
-  return [head, `Proposer summary: ${a.summary.slice(0, 1000)}`, ...losses, ...diff].join("\n");
+const FULL_ATTEMPTS = 9;
+
+function attemptBlock(a: Attempt, full: boolean): string {
+  const head = `### ${a.source ? `${a.source} ` : ""}Round ${a.round}, ${a.focus}: ${a.accepted ? "PROMOTED" : "NOT PROMOTED"} (${a.reason})`;
+  const losses = a.losses.length ? ["Why the other skill won some pairs (judge reasons):", ...a.losses.slice(0, full ? 12 : 3).map(l => `- ${l}`)] : [];
+  const diff = a.accepted || !full ? [] : [`Diff (do not repeat it as is):\n\`\`\`diff\n${a.diff.slice(0, 4000)}\n\`\`\``];
+  return [head, `Proposer summary: ${a.summary.slice(0, full ? 1000 : 500)}`, ...losses, ...diff].join("\n");
 }
 
-function attemptsBlock(attempts: Attempt[]): string {
-  return attempts.length ? attempts.map(attemptBlock).join("\n\n") : "None yet. This is the first round.";
+export function attemptsBlock(attempts: Attempt[]): string {
+  if (!attempts.length) return "None yet. This is the first round.";
+  const cut = attempts.length - FULL_ATTEMPTS;
+  return attempts.map((a, i) => attemptBlock(a, i >= cut)).join("\n\n");
 }
 
 async function sideBySide(e: FeedbackEval, s: BuildScore, path: string): Promise<boolean> {

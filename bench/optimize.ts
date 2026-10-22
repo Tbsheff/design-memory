@@ -5,15 +5,15 @@ import { readFlags, round, selectTargets, timestamp } from "./lib.ts";
 import type { BuildScore, Mode, Target } from "./lib.ts";
 import { armSummary, lintCandidate, splitTargets } from "./objective.ts";
 import type { ArmScore } from "./objective.ts";
-import { FOCUSES, proposerPrompt, writeFeedback } from "./optimize-feedback.ts";
+import { focusById, FOCUSES, proposerPrompt, writeFeedback } from "./optimize-feedback.ts";
 import type { Attempt, CaseLabel, Focus } from "./optimize-feedback.ts";
-import { writeOptimizeReport } from "./optimize-report.ts";
+import { contactSheet, writeOptimizeReport } from "./optimize-report.ts";
 import { judgePairs } from "./pair-judge.ts";
 import type { ArmRef, PairResult } from "./pair-judge.ts";
 import { addTotals, decide, EMPTY_TOTALS, focusOrder, holdoutEstimate, pickBest, planRound, QUESTIONS, unitCosts } from "./pairwise.ts";
 import type { AcceptRule, CostTotals, Decision, PairOutcome, PairSummary, Question } from "./pairwise.ts";
 import { BENCH, loadTargets, runBench } from "./run.ts";
-import { readJson, restoreRounds, savedProposal } from "./resume.ts";
+import { attemptsFrom, readJson, restoreRounds, savedProposal } from "./resume.ts";
 import type { CandidateRecord, RoundRecord } from "./resume.ts";
 import { loadRules, scoreRun } from "./score.ts";
 import { parseClaudeOutput, run, runClaude, SKILL_FILES } from "./tools.ts";
@@ -26,7 +26,7 @@ export type OptimizeOptions = {
   rounds: number; samples: number; budgetUsd: number; holdoutSamples: number; candidates: number;
   trainTargets: string[] | null; holdoutTargets: string[] | null;
   model: string; judgeModel: string; proposerModel: string; concurrency: number; buildBudgetUsd: number; out: string | null;
-  accept: AcceptRule;
+  accept: AcceptRule; seedFrom: string | null; extraArms?: { name: string; dir: string }[]; seedFocus: { round: number; focus: string } | null; changes?: { round: number; note: string }[];
 };
 
 function num(flags: Map<string, string>, key: string, fallback: number): number {
@@ -39,13 +39,31 @@ function num(flags: Map<string, string>, key: string, fallback: number): number 
 
 const FLAGS = new Set([
   "rounds", "samples", "budget-usd", "holdout-samples", "candidates", "train-targets", "holdout-targets", "model", "judge-model", "proposer-model",
-  "concurrency", "build-budget-usd", "out", "accept-on", "min-win-rate", "max-p", "min-guard-rate",
+  "concurrency", "build-budget-usd", "out", "accept-on", "min-win-rate", "max-p", "min-guard-rate", "guard-loss-p", "seed-from", "guards", "seed-focus",
 ]);
 
 function acceptRule(flags: Map<string, string>): AcceptRule {
   const on = flags.get("accept-on") ?? "closer";
   if (!(QUESTIONS as readonly string[]).includes(on)) throw new Error(`--accept-on must be ${QUESTIONS.join(" or ")}`);
-  return { on: on as Question, minWinRate: num(flags, "min-win-rate", 0.6), maxP: num(flags, "max-p", 0.2), minGuardRate: num(flags, "min-guard-rate", 0.4) };
+  return { on: on as Question, minWinRate: num(flags, "min-win-rate", 0.6), maxP: num(flags, "max-p", 0.2), minGuardRate: num(flags, "min-guard-rate", 0.4), guardLossP: num(flags, "guard-loss-p", 0.2), guards: guardList(flags.get("guards"), on as Question) };
+}
+
+function guardList(value: string | undefined, on: Question): Question[] {
+  const list = value ? value.split(",").map(x => x.trim()).filter(Boolean) : QUESTIONS.filter(q => q !== on);
+  const bad = list.filter(q => !(QUESTIONS as readonly string[]).includes(q) || q === on);
+  if (bad.length) throw new Error(`--guards must name questions other than --accept-on: ${bad.join(", ")}`);
+  return list as Question[];
+}
+
+function seedFocusFlag(value: string | undefined): { round: number; focus: string } | null {
+  if (!value) return null;
+  focusById(value);
+  return { round: 1, focus: value };
+}
+
+export function roundFocuses(o: Pick<OptimizeOptions, "seedFocus">, k: number, count: number): Focus[] {
+  if (o.seedFocus?.round !== k) return focusOrder(FOCUSES, k, count);
+  return [focusById(o.seedFocus.focus), ...focusOrder(FOCUSES, k, count - 1)];
 }
 
 export function parseOptimizeArgs(argv: string[]): OptimizeOptions {
@@ -61,7 +79,7 @@ export function parseOptimizeArgs(argv: string[]): OptimizeOptions {
     trainTargets: ids("train-targets"), holdoutTargets: ids("holdout-targets"),
     model: flags.get("model") ?? "sonnet", judgeModel: flags.get("judge-model") ?? "opus", proposerModel: flags.get("proposer-model") ?? "opus",
     concurrency: Math.round(num(flags, "concurrency", 6)), buildBudgetUsd: num(flags, "build-budget-usd", 5), out: flags.get("out") ?? null,
-    accept: acceptRule(flags),
+    accept: acceptRule(flags), seedFrom: flags.get("seed-from") ?? null, seedFocus: seedFocusFlag(flags.get("seed-focus")),
   };
 }
 
@@ -213,12 +231,12 @@ async function oneRound(ctx: Ctx, k: number, st: LoopState, labels: CaseLabel, c
   const inc = await evaluate(ctx, { name: `round-${k}-incumbent`, skillDir: st.incDir, targets: ctx.train, modes: ["taste"], samples: o.samples, score: true });
   const rules = await loadRules(inc.out);
   const input: RoundInput = { k, incDir: st.incDir, inc, labels, attempts: st.attempts };
-  const proposals = await Promise.all(focusOrder(FOCUSES, k, count).map(f => propose(ctx, f, input)));
+  const proposals = await Promise.all(roundFocuses(o, k, count).map(f => propose(ctx, f, input)));
   const concurrency = Math.max(1, Math.ceil(o.concurrency / proposals.length));
   const trials = await Promise.all(proposals.map(p => trial(ctx, p, input, rules, concurrency)));
   const best = pickBest(trials.filter((t): t is Judged => t.summary !== null), o.accept.on);
   const record: RoundRecord = {
-    round: k, incumbent_dir: st.incDir, incumbent_from: st.incFrom, incumbent_eval: inc.out, incumbent_score: armSummary(inc.byMode.taste ?? []),
+    round: k, questions: [...QUESTIONS], change: o.changes?.find(c => c.round === k)?.note, incumbent_dir: st.incDir, incumbent_from: st.incFrom, incumbent_eval: inc.out, incumbent_score: armSummary(inc.byMode.taste ?? []),
     candidates: trials.map(t => t.rec), promoted: best?.rec.focus ?? null, cost: round(ctx.spent - before), spent_after: ctx.spent, totals: ctx.totals,
   };
   st.history.push(record);
@@ -243,33 +261,62 @@ async function runLoop(ctx: Ctx, st: LoopState, labels: CaseLabel): Promise<stri
   }
 }
 
-type Holdout = { arms: Record<"baseline" | "original" | "best", ArmScore>; pairs: Record<string, PairSummary>; runs: { original: string; best: string } };
+type Holdout = { arms: Record<string, ArmScore>; pairs: Record<string, PairSummary>; runs: Record<string, string> };
+export type Arm = { name: string; ref: ArmRef; scores: BuildScore[] };
+
+function extraDir(opt: string, dir: string): string {
+  return dir.startsWith("/") ? dir : join(opt, dir);
+}
+
+async function extraArms(ctx: Ctx, hs: number): Promise<Arm[]> {
+  const out: Arm[] = [];
+  for (const x of ctx.options.extraArms ?? []) {
+    const e = await evaluate(ctx, { name: `holdout-${x.name}`, skillDir: extraDir(ctx.opt, x.dir), targets: ctx.holdout, modes: ["taste"], samples: hs, score: true });
+    out.push({ name: x.name, ref: { out: e.out, mode: "taste" }, scores: e.byMode.taste ?? [] });
+  }
+  return out;
+}
+
+export function comparisons(arms: Arm[], extras: Arm[], bestDiffers: boolean): [string, Arm, Arm][] {
+  const [baseline, original, best] = arms as [Arm, Arm, Arm];
+  const list: [string, Arm, Arm][] = [["best_vs_baseline", baseline, best]];
+  if (bestDiffers) list.push(["best_vs_original", original, best]);
+  for (const x of extras) {
+    list.push([`${x.name}_vs_original`, original, x], [`${x.name}_vs_baseline`, baseline, x]);
+    if (bestDiffers) list.push([`${x.name}_vs_best`, best, x]);
+  }
+  return list;
+}
 
 async function holdoutEvals(ctx: Ctx, original: string, st: LoopState): Promise<Holdout> {
   const hs = ctx.options.holdoutSamples;
   const base = await evaluate(ctx, { name: "holdout-original", skillDir: original, targets: ctx.holdout, modes: ["baseline", "taste"], samples: hs, score: true });
   const best = st.incFrom > 0 ? await evaluate(ctx, { name: "holdout-best", skillDir: st.incDir, targets: ctx.holdout, modes: ["taste"], samples: hs, score: true }) : base;
+  const arms: Arm[] = [
+    { name: "baseline", ref: { out: base.out, mode: "baseline" }, scores: base.byMode.baseline ?? [] },
+    { name: "original", ref: { out: base.out, mode: "taste" }, scores: base.byMode.taste ?? [] },
+    { name: "best", ref: { out: best.out, mode: "taste" }, scores: best.byMode.taste ?? [] },
+  ];
+  const extras = await extraArms(ctx, hs);
   const rules = await loadRules(base.out);
-  const bestRef = { out: best.out, mode: "taste" };
-  const dir = (name: string) => join(ctx.opt, "holdout-pairs", name);
-  const conc = ctx.options.concurrency;
   const pairs: Record<string, PairSummary> = {};
-  pairs.best_vs_baseline = (await pairUp(ctx, dir("best-vs-baseline"), { out: base.out, mode: "baseline" }, bestRef, ctx.holdout, hs, rules, conc)).summary;
-  if (st.incFrom > 0) pairs.best_vs_original = (await pairUp(ctx, dir("best-vs-original"), { out: base.out, mode: "taste" }, bestRef, ctx.holdout, hs, rules, conc)).summary;
-  const arms = { baseline: armSummary(base.byMode.baseline ?? []), original: armSummary(base.byMode.taste ?? []), best: armSummary(best.byMode.taste ?? []) };
-  return { arms, pairs, runs: { original: base.out, best: best.out } };
+  for (const [name, a, b] of comparisons(arms, extras, st.incFrom > 0)) {
+    pairs[name] = (await pairUp(ctx, join(ctx.opt, "holdout-pairs", name.replaceAll("_", "-")), a.ref, b.ref, ctx.holdout, hs, rules, ctx.options.concurrency)).summary;
+  }
+  const all = [...arms, ...extras];
+  return { arms: Object.fromEntries(all.map(a => [a.name, armSummary(a.scores)])), pairs, runs: Object.fromEntries(all.filter(a => a.name !== "baseline").map(a => [a.name, a.ref.out])) };
 }
 
 async function finish(ctx: Ctx, st: LoopState, original: string, stop: string) {
   log(`stop: ${stop}. Best skill is from round ${st.incFrom}. Running holdout.`);
   const h = await holdoutEvals(ctx, original, st);
   const final = {
-    stop_reason: stop, best_round: st.incFrom, best_dir: st.incDir, original_dir: original, accept_rule: ctx.options.accept,
+    stop_reason: stop, best_round: st.incFrom, best_dir: st.incDir, original_dir: original, accept_rule: ctx.options.accept, changes: ctx.options.changes ?? [],
     holdout_targets: ctx.holdout.map(t => t.id), holdout_samples: ctx.options.holdoutSamples,
     holdout: h.arms, holdout_pairs: h.pairs, holdout_runs: h.runs, total_cost_usd: ctx.spent, cost_totals: ctx.totals,
   };
   writeFileSync(join(ctx.opt, "final.json"), JSON.stringify(final, null, 2));
-  await writeOptimizeReport(ctx.opt, final, st.history, await skillDiff(original, st.incDir));
+  await writeOptimizeReport(ctx.opt, final, st.history, await skillDiff(original, st.incDir), await contactSheet(ctx.opt, final));
   log(`done. total $${ctx.spent.toFixed(2)}. ${join(ctx.opt, "report.html")}`);
 }
 
@@ -295,6 +342,18 @@ function labelsFor(train: Target[]): CaseLabel {
   return new Map(train.map((t, i) => [t.id, `case-${i + 1}`]));
 }
 
+const SEED_FILE = "seed-attempts.json";
+
+function seedAttempts(opt: string, from: string | null): Attempt[] {
+  if (!from) return [];
+  const history = readJson<RoundRecord[]>(join(resolve(from), "history.json"));
+  if (!history) throw new Error(`--seed-from ${from} has no history.json`);
+  const label = from.replace(/\/+$/, "").split("/").at(-1) ?? "seed";
+  const seeds = attemptsFrom(history).map(a => ({ ...a, accepted: false, source: `earlier run ${label},` }));
+  writeFileSync(join(opt, SEED_FILE), JSON.stringify(seeds, null, 2));
+  return seeds;
+}
+
 function freshSetup(options: OptimizeOptions): Setup {
   const all = loadTargets();
   const opt = resolve(options.out ?? join(BENCH, "optimize", timestamp()));
@@ -304,8 +363,9 @@ function freshSetup(options: OptimizeOptions): Setup {
   writeFileSync(join(opt, "options.json"), JSON.stringify({ ...options, train: ctx.train.map(t => t.id), holdout: ctx.holdout.map(t => t.id) }, null, 2));
   const original = originalSkill(opt);
   writeHistory(opt, []);
+  const seeds = seedAttempts(opt, options.seedFrom);
   log(`optimize ${opt}: train ${ctx.train.length} x ${options.samples}, ${options.candidates} candidates/round, holdout ${ctx.holdout.length} x ${options.holdoutSamples}, budget $${options.budgetUsd}`);
-  return { ctx, original, labels: labelsFor(ctx.train), st: { incDir: original, incFrom: 0, history: [], attempts: [], nextRound: 1 } };
+  return { ctx, original, labels: labelsFor(ctx.train), st: { incDir: original, incFrom: 0, history: [], attempts: seeds, nextRound: 1 } };
 }
 
 function resumeSetup(dir: string): Setup {
@@ -317,8 +377,9 @@ function resumeSetup(dir: string): Setup {
   const original = join(opt, "original");
   const r = restoreRounds(history, original);
   const ctx: Ctx = { opt, options: stored, train: pickTargets(all, stored.train), holdout: pickTargets(all, stored.holdout), spent: r.spent, totals: r.totals, resume: true };
+  for (const c of stored.changes ?? []) if (c.round >= r.nextRound) log(`change from round ${c.round}: ${c.note}`);
   log(`resume ${opt}: ${history.length} rounds done, incumbent from round ${r.incumbentFrom}, spent $${ctx.spent.toFixed(2)}`);
-  return { ctx, original, labels: labelsFor(ctx.train), st: { incDir: r.incumbentDir, incFrom: r.incumbentFrom, history, attempts: r.attempts, nextRound: r.nextRound } };
+  return { ctx, original, labels: labelsFor(ctx.train), st: { incDir: r.incumbentDir, incFrom: r.incumbentFrom, history, attempts: [...(readJson<Attempt[]>(join(opt, SEED_FILE)) ?? []), ...r.attempts], nextRound: r.nextRound } };
 }
 
 export function resumeArg(argv: string[]): string | null {

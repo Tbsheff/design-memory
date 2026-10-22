@@ -6,16 +6,16 @@ export type Arm = "a" | "b";
 export type Vote = Arm | "tie";
 export type Order = "ab" | "ba";
 export const ORDERS: Order[] = ["ab", "ba"];
-export const QUESTIONS = ["closer", "rules"] as const;
+export const QUESTIONS = ["closer", "rules", "calmer"] as const;
 export type Question = (typeof QUESTIONS)[number];
 
-export type PairVerdict = { closer: Side; closer_reason: string; rules: Side; rules_reason: string };
+export type PairVerdict = Record<Question, Side> & { [K in Question as `${K}_reason`]: string };
 export type PairKey = { target: string; sample: number };
 export type PairCall = PairKey & { order: Order };
 export type CallResult = PairCall & { verdict?: PairVerdict; auto?: Vote; cost: number; error?: string };
-export type PairOutcome = PairKey & { closer: Vote | null; rules: Vote | null; split: Record<Question, boolean>; reasons: Record<Question, { winner: Arm; reason: string }[]> };
+export type PairOutcome = PairKey & Record<Question, Vote | null> & { split: Record<Question, boolean>; reasons: Record<Question, { winner: Arm; reason: string }[]> };
 export type WinStats = { wins: number; losses: number; ties: number; n: number; win_rate: number | null; p: number };
-export type AcceptRule = { on: Question; minWinRate: number; maxP: number; minGuardRate: number };
+export type AcceptRule = { on: Question; minWinRate: number; maxP: number; minGuardRate: number; guardLossP: number; guards?: Question[] };
 export type Decision = { accept: boolean; reason: string };
 export type PairSummary = Record<Question, WinStats> & { pairs: number; split: Record<Question, number>; judge_errors: number };
 
@@ -29,15 +29,16 @@ Both builds are web pages made from the same short text prompt. Read all three i
 
 Ignore any gray backdrop, device frame or drop shadow around the target; compare the app screen itself. Do not reward or punish the exact sample text or numbers.
 
-Answer two questions:
+Answer three questions:
 1. closer: which build looks closer to the target as a whole (layout, density, type, color, components, detail)?
 2. rules: which build follows these design rules better? Judge only from what you can see.
 ${list}
+3. calmer: which build is calmer and less busy, with fewer competing elements, badges, accents and columns, while it still shows what the screen needs? A build that leaves out what the screen needs is not calmer, only emptier.
 
 Pick "tie" only when you truly cannot choose. In each reason, say what the better build does that the other does not. Do not say left or right in a reason; say "the better build" and "the other build".
 
 Reply with ONLY one JSON object, no prose and no code fence, in exactly this shape:
-{"closer":"left","closer_reason":"one line","rules":"right","rules_reason":"one line"}`;
+{"closer":"left","closer_reason":"one line","rules":"right","rules_reason":"one line","calmer":"tie","calmer_reason":"one line"}`;
 }
 
 function side(value: unknown, name: string): Side {
@@ -53,7 +54,12 @@ function reason(value: unknown, name: string): string {
 
 export function parsePairVerdict(text: string): PairVerdict {
   const raw = extractJsonObject(text) as Record<string, unknown>;
-  return { closer: side(raw.closer, "closer"), closer_reason: reason(raw.closer_reason, "closer_reason"), rules: side(raw.rules, "rules"), rules_reason: reason(raw.rules_reason, "rules_reason") };
+  const out: Record<string, string> = {};
+  for (const q of QUESTIONS) {
+    out[q] = side(raw[q], q);
+    out[`${q}_reason`] = reason(raw[`${q}_reason`], `${q}_reason`);
+  }
+  return out as PairVerdict;
 }
 
 export function leftArm(order: Order): Arm {
@@ -113,12 +119,8 @@ export function outcomes(results: CallResult[]): PairOutcome[] {
   for (const r of results) groups.set(`${r.target}\u0000${r.sample}`, [...(groups.get(`${r.target}\u0000${r.sample}`) ?? []), r]);
   return [...groups.values()].map(rs => {
     const votes = (q: Question) => rs.map(r => voteOf(r, q));
-    return {
-      target: rs[0]!.target, sample: rs[0]!.sample,
-      closer: combineVotes(votes("closer")), rules: combineVotes(votes("rules")),
-      split: { closer: isSplit(votes("closer")), rules: isSplit(votes("rules")) },
-      reasons: { closer: reasonsOf(rs, "closer"), rules: reasonsOf(rs, "rules") },
-    };
+    const per = <T>(f: (q: Question) => T) => Object.fromEntries(QUESTIONS.map(q => [q, f(q)])) as Record<Question, T>;
+    return { target: rs[0]!.target, sample: rs[0]!.sample, ...per(q => combineVotes(votes(q))), split: per(q => isSplit(votes(q))), reasons: per(q => reasonsOf(rs, q)) };
   });
 }
 
@@ -144,11 +146,8 @@ export function winStats(votes: (Vote | null)[]): WinStats {
 }
 
 export function summarizePairs(list: PairOutcome[], results: CallResult[]): PairSummary {
-  return {
-    closer: winStats(list.map(o => o.closer)), rules: winStats(list.map(o => o.rules)), pairs: list.length,
-    split: { closer: list.filter(o => o.split.closer).length, rules: list.filter(o => o.split.rules).length },
-    judge_errors: results.filter(r => !r.auto && !r.verdict).length,
-  };
+  const per = <T>(f: (q: Question) => T) => Object.fromEntries(QUESTIONS.map(q => [q, f(q)])) as Record<Question, T>;
+  return { ...per(q => winStats(list.map(o => o[q]))), pairs: list.length, split: per(q => list.filter(o => o.split[q]).length), judge_errors: results.filter(r => !r.auto && !r.verdict).length };
 }
 
 const pct = (x: number | null) => (x === null ? "–" : `${Math.round(x * 100)}%`);
@@ -157,15 +156,26 @@ export function statLine(s: WinStats): string {
   return `${s.wins}-${s.losses}-${s.ties} (win rate ${pct(s.win_rate)} over ${s.n} non-ties, p ${s.p.toFixed(3)})`;
 }
 
+export function guardsOf(rule: AcceptRule): Question[] {
+  return rule.guards ?? QUESTIONS.filter(q => q !== rule.on);
+}
+
+function guardProblem(name: Question, g: WinStats | undefined, rule: AcceptRule): string | null {
+  if (!g) return null;
+  if (g.win_rate !== null && g.win_rate < rule.minGuardRate) return `${name} win rate below guard ${rule.minGuardRate}`;
+  const lossP = signTestP(g.losses, g.n);
+  return lossP < rule.guardLossP ? `${name} loses clearly (p ${lossP.toFixed(3)} < ${rule.guardLossP})` : null;
+}
+
 export function decide(summary: PairSummary, rule: AcceptRule): Decision {
   const main = summary[rule.on];
-  const guard = summary[rule.on === "closer" ? "rules" : "closer"];
-  const guardName = rule.on === "closer" ? "rules" : "closer";
-  const why = `${rule.on} ${statLine(main)}; ${guardName} ${statLine(guard)}`;
+  const guards = guardsOf(rule);
+  const why = [rule.on, ...guards].filter(q => summary[q]).map(q => `${q} ${statLine(summary[q])}`).join("; ");
   if (main.win_rate === null) return { accept: false, reason: `no non-tie pairs on ${rule.on}. ${why}` };
   if (main.win_rate < rule.minWinRate) return { accept: false, reason: `${rule.on} win rate below ${rule.minWinRate}. ${why}` };
   if (main.p >= rule.maxP) return { accept: false, reason: `${rule.on} p not below ${rule.maxP}. ${why}` };
-  if (guard.win_rate !== null && guard.win_rate < rule.minGuardRate) return { accept: false, reason: `${guardName} win rate below guard ${rule.minGuardRate}. ${why}` };
+  const problems = guards.map(q => guardProblem(q, summary[q], rule)).filter(Boolean);
+  if (problems.length) return { accept: false, reason: `${problems.join("; ")}. ${why}` };
   return { accept: true, reason: `beats incumbent. ${why}` };
 }
 
