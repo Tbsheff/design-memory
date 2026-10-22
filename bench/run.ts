@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { buildPrompt, parseRunArgs, selectTargets, timestamp, viewportFor } from "./lib.ts";
 import type { Mode, RunOptions, Target } from "./lib.ts";
+import { readJson, splitJobs } from "./resume.ts";
 import { renderPage, runClaude, sanitizedTasteHome, tastePlugin } from "./tools.ts";
 import type { ClaudeCall, ClaudeResult } from "./tools.ts";
 
@@ -15,13 +16,20 @@ export function loadTargets(): Target[] {
 type Job = { target: Target; mode: Mode; sample: number };
 type Context = { out: string; options: RunOptions; tasteHome: string; plugin: string; skillDir: string };
 
+export type RunInfo = { out: string; cost_usd: number; builds: number; failed: number };
+
 const BASE_TOOLS = ["Read", "Write", "Edit", "Skill"];
+const TASTE_TOOLS = ["Write", "Edit", "Skill"];
 const TASTE_BASH = ["Bash(taste *)", "Bash(*/scripts/taste *)"];
 const HOOK = join(BENCH, "taste-hook.ts");
 
 function tasteExtra(ctx: Context): string[] {
   const hooks = { hooks: { PreToolUse: [{ matcher: "Bash", hooks: [{ type: "command", command: `bun ${JSON.stringify(HOOK)}` }] }] } };
   return ["--plugin-dir", ctx.plugin, "--add-dir", ctx.plugin, "--settings", JSON.stringify(hooks)];
+}
+
+export function tasteReadRules(tasteHome: string): string[] {
+  return ["media", "thumbs"].map(dir => `Read(/${join(tasteHome, dir)}/**)`);
 }
 
 function callFor(job: Job, ctx: Context, cwd: string): ClaudeCall {
@@ -31,7 +39,7 @@ function callFor(job: Job, ctx: Context, cwd: string): ClaudeCall {
     cwd,
     model: ctx.options.model,
     tools: taste ? [...BASE_TOOLS, "Bash"] : BASE_TOOLS,
-    allowed: taste ? [...BASE_TOOLS, ...TASTE_BASH] : BASE_TOOLS,
+    allowed: taste ? [...TASTE_TOOLS, ...tasteReadRules(ctx.tasteHome), ...TASTE_BASH] : BASE_TOOLS,
     extra: taste ? tasteExtra(ctx) : [],
     env: { DESIGN_MEMORY_HOME: ctx.tasteHome, TASTE_HOOK_DIRS: ctx.skillDir },
     timeoutMs: ctx.options.timeoutMinutes * 60_000,
@@ -51,7 +59,10 @@ function tasteUsage(result: ClaudeResult) {
   const skills = result.tool_uses.filter(u => u.name === "Skill").map(u => String((u.input as { skill?: string })?.skill ?? ""));
   const bash = result.tool_uses.filter(u => u.name === "Bash").map(u => ({ command: String((u.input as { command?: string })?.command ?? ""), ok: u.ok, result_head: u.result_head.slice(0, 200) }));
   const taste = bash.filter(b => /\btaste\b/.test(b.command));
+  const images = result.tool_uses.filter(u => u.name === "Read" && /\/(media|thumbs)\//.test(String((u.input as { file_path?: string })?.file_path ?? "")));
   return {
+    image_reads: images.length,
+    image_reads_ok: images.filter(u => u.ok).length,
     skills_used: skills,
     skill_used: skills.some(s => s.includes("taste-use")),
     taste_calls: taste.length,
@@ -70,8 +81,14 @@ async function renderInto(dir: string, target: Target): Promise<string | undefin
   }
 }
 
+function jobDir(out: string, job: Job): string {
+  return join(out, job.target.id, job.mode, String(job.sample));
+}
+
+const jobKey = (job: Job) => ({ target: job.target.id, mode: job.mode, sample: job.sample });
+
 async function build(job: Job, ctx: Context): Promise<Record<string, unknown>> {
-  const dir = join(ctx.out, job.target.id, job.mode, String(job.sample));
+  const dir = jobDir(ctx.out, job);
   mkdirSync(dir, { recursive: true });
   const cwd = mkdtempSync(join(tmpdir(), "design-bench-"));
   if (job.mode === "reference") copyFileSync(join(BENCH, job.target.image), join(cwd, "reference.jpg"));
@@ -116,29 +133,45 @@ function jobsFor(targets: Target[], options: RunOptions): Job[] {
   return targets.flatMap(target => options.modes.flatMap(mode => Array.from({ length: options.samples }, (_, i) => ({ target, mode, sample: i + 1 }))));
 }
 
-async function main() {
-  const options = parseRunArgs(process.argv.slice(2));
-  const targets = selectTargets(loadTargets(), options.targets);
+type Sanitized = Awaited<ReturnType<typeof sanitizedTasteHome>>;
+
+async function tasteHomeFor(out: string, tasteHome: string, resume: boolean): Promise<Sanitized> {
+  if (!resume || !existsSync(join(tasteHome, "library.sqlite3"))) return sanitizedTasteHome(tasteHome, loadTargets());
+  const prior = readJson<{ taste_home?: Sanitized }>(join(out, "run.json"))?.taste_home;
+  return prior ?? { removed_refs: [], removed_files: 0, preferences_mentioning_targets: 0 };
+}
+
+export async function runBench(options: RunOptions, targets: Target[], quiet = false, resume = false): Promise<RunInfo> {
   const out = resolve(options.out ?? join(BENCH, "runs", timestamp()));
   mkdirSync(join(out, "targets"), { recursive: true });
   for (const t of targets) copyFileSync(join(BENCH, t.image), join(out, "targets", `${t.id}.jpg`));
   const tasteHome = join(out, ".taste-home");
-  const sanitize = await sanitizedTasteHome(tasteHome, loadTargets());
+  const sanitize = await tasteHomeFor(out, tasteHome, resume);
   const plugin = join(out, ".taste-plugin");
-  const ctx: Context = { out, options, tasteHome, plugin, skillDir: tastePlugin(plugin) };
-  const jobs = jobsFor(targets, options);
+  const ctx: Context = { out, options, tasteHome, plugin, skillDir: tastePlugin(plugin, options.skillDir ? resolve(options.skillDir) : null, resume) };
+  const all = jobsFor(targets, options);
+  const split = resume ? splitJobs(all, jobKey, job => readJson<Record<string, unknown>>(join(jobDir(out, job), "meta.json"))) : { reuse: [], todo: all };
+  const jobs = split.todo;
   const started = new Date();
-  console.log(`run ${out}: ${jobs.length} builds, concurrency ${options.concurrency}, taste refs removed: ${sanitize.removed_refs.length}`);
+  const log = (line: string) => { if (!quiet) console.log(line); };
+  log(`run ${out}: ${jobs.length} builds (${split.reuse.length} reused), concurrency ${options.concurrency}, taste refs removed: ${sanitize.removed_refs.length}`);
   let done = 0;
-  const metas = await pool(jobs, options.concurrency, async job => {
+  const built = await pool(jobs, options.concurrency, async job => {
     const meta = await build(job, ctx);
-    console.log(`[${++done}/${jobs.length}] ${job.target.id} ${job.mode} #${job.sample} ${meta.ok ? "ok" : `FAILED ${meta.error}`} $${Number(meta.cost_usd ?? 0).toFixed(2)}`);
+    log(`[${++done}/${jobs.length}] ${job.target.id} ${job.mode} #${job.sample} ${meta.ok ? "ok" : `FAILED ${meta.error}`} $${Number(meta.cost_usd ?? 0).toFixed(2)}`);
     return meta;
   });
+  const metas = [...split.reuse.map(r => r.meta), ...built];
   const finished = new Date();
   const run = { started: started.toISOString(), finished: finished.toISOString(), wall_ms: finished.getTime() - started.getTime(), options, targets: targets.map(t => t.id), taste_home: sanitize, builds: metas.length, failed: metas.filter(m => !m.ok).length, cost_usd: metas.reduce((a, m) => a + Number(m.cost_usd ?? 0), 0) };
   writeFileSync(join(out, "run.json"), JSON.stringify(run, null, 2));
-  console.log(`done in ${Math.round(run.wall_ms / 1000)} s, ${run.failed} failed, $${run.cost_usd.toFixed(2)}. Next: bun bench/score.ts --run ${out}`);
+  log(`done in ${Math.round(run.wall_ms / 1000)} s, ${run.failed} failed, $${run.cost_usd.toFixed(2)}. Next: bun bench/score.ts --run ${out}`);
+  return { out, cost_usd: run.cost_usd, builds: run.builds, failed: run.failed };
+}
+
+async function main() {
+  const options = parseRunArgs(process.argv.slice(2));
+  await runBench(options, selectTargets(loadTargets(), options.targets));
 }
 
 if (import.meta.main) await main();

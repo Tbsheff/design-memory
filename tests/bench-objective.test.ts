@@ -1,0 +1,178 @@
+import { describe, expect, test } from "bun:test";
+import { parseJudgement, parseRunArgs } from "../bench/lib.ts";
+import type { Target } from "../bench/lib.ts";
+import {
+  buildObjective, compareEvals, evalScore, lintCandidate, meanSe, objective, parseProfileRules, parseRuleJudgement, prepareHtml,
+  rulePass, splitTargets, stopReason, worstBuilds,
+} from "../bench/objective.ts";
+import { parseOptimizeArgs } from "../bench/optimize.ts";
+
+const t = (id: string, split?: "train" | "holdout"): Target => ({ id, image: "", source_url: "", author: "a", prompt: "", width: 1, height: 1, split });
+
+describe("split filter", () => {
+  test("keeps only the asked split and drops unsplit targets", () => {
+    const all = [t("a", "train"), t("b", "holdout"), t("c"), t("d", "train")];
+    expect(splitTargets(all, "train").map(x => x.id)).toEqual(["a", "d"]);
+    expect(splitTargets(all, "holdout").map(x => x.id)).toEqual(["b"]);
+  });
+
+  test("the real targets have 5 train and 3 holdout", async () => {
+    const targets = (await Bun.file(new URL("../bench/targets.json", import.meta.url)).json()) as Target[];
+    expect(splitTargets(targets, "train")).toHaveLength(5);
+    expect(splitTargets(targets, "holdout")).toHaveLength(3);
+  });
+});
+
+describe("objective math", () => {
+  test("weights overall and rule pass", () => {
+    expect(objective(10, 1)).toBe(1);
+    expect(objective(5, 0.5)).toBe(0.5);
+    expect(objective(6, 0.8)).toBe(0.66);
+  });
+
+  test("no applicable rules uses the look score alone", () => {
+    expect(rulePass(0, 0)).toBeNull();
+    expect(objective(7, null)).toBe(0.7);
+    expect(rulePass(3, 1)).toBe(0.75);
+  });
+
+  test("a failed build scores 0 and a judge failure is left out", () => {
+    expect(buildObjective(false, undefined, undefined)).toBe(0);
+    expect(buildObjective(true, undefined, undefined)).toBeNull();
+  });
+
+  test("mean and standard error", () => {
+    expect(meanSe([0.5])).toEqual({ n: 1, mean: 0.5, se: 0 });
+    const m = meanSe([0.4, 0.6]);
+    expect(m.mean).toBe(0.5);
+    expect(m.se).toBeCloseTo(0.1, 4);
+    expect(meanSe([]).n).toBe(0);
+    expect(evalScore([{ target: "a", objective: 0.2 }, { target: "a", objective: null }]).n).toBe(1);
+  });
+
+  test("worst builds skip unscored ones", () => {
+    const s = [{ target: "a", objective: 0.5 }, { target: "b", objective: null }, { target: "c", objective: 0.1 }];
+    expect(worstBuilds(s, 2).map(x => x.target)).toEqual(["c", "a"]);
+  });
+});
+
+describe("acceptance rule", () => {
+  const ev = (pairs: [string, number][]) => pairs.map(([target, objective]) => ({ target, objective }));
+
+  test("accepts a clear paired gain", () => {
+    const c = compareEvals(ev([["a", 0.5], ["b", 0.4], ["c", 0.6]]), ev([["a", 0.6], ["b", 0.5], ["c", 0.68]]));
+    expect(c.accept).toBe(true);
+    expect(c.diff).toBeCloseTo(0.0933, 3);
+  });
+
+  test("rejects a gain below the 0.02 floor", () => {
+    expect(compareEvals(ev([["a", 0.5]]), ev([["a", 0.515]])).accept).toBe(false);
+    expect(compareEvals(ev([["a", 0.5]]), ev([["a", 0.53]])).accept).toBe(true);
+  });
+
+  test("rejects a gain inside one standard error", () => {
+    const c = compareEvals(ev([["a", 0.5], ["b", 0.5]]), ev([["a", 0.7], ["b", 0.42]]));
+    expect(c.diff).toBeCloseTo(0.06, 4);
+    expect(c.se).toBeCloseTo(0.14, 4);
+    expect(c.accept).toBe(false);
+  });
+
+  test("averages samples per target and ignores targets only one side has", () => {
+    const c = compareEvals(ev([["a", 0.4], ["a", 0.6], ["z", 0.9]]), ev([["a", 0.6], ["a", 0.6]]));
+    expect(c.targets).toBe(1);
+    expect(c.diff).toBeCloseTo(0.1, 4);
+  });
+
+  test("no shared targets never accepts", () => {
+    expect(compareEvals([], ev([["a", 1]])).accept).toBe(false);
+  });
+
+  test("stop reasons", () => {
+    const base = { round: 2, rounds: 5, spent: 10, nextRound: 6, reserve: 8, budget: 45, rejectStreak: 0 };
+    expect(stopReason(base)).toBeNull();
+    expect(stopReason({ ...base, round: 6 })).toContain("finished");
+    expect(stopReason({ ...base, rejectStreak: 2 })).toContain("2 rejections");
+    expect(stopReason({ ...base, spent: 32 })).toContain("budget");
+  });
+});
+
+describe("rule judge", () => {
+  const rules = ["Prefer: a", "Avoid: b", "Prefer: c"];
+  const reply = (entries: unknown[]) => `Sure:\n\`\`\`json\n${JSON.stringify({ rules: entries })}\n\`\`\``;
+
+  test("parses verdicts and computes the pass rate", () => {
+    const r = parseRuleJudgement(reply([{ id: 1, verdict: "meets", reason: "x" }, { id: 2, verdict: "misses", reason: "y" }, { id: 3, verdict: "N/A", reason: "z" }]), rules);
+    expect(r).toMatchObject({ meets: 1, misses: 1, na: 1, rule_pass: 0.5 });
+    expect(r.results[1]).toEqual({ rule: "Avoid: b", verdict: "misses", reason: "y" });
+  });
+
+  test("all n-a gives a null pass rate", () => {
+    const r = parseRuleJudgement(reply(rules.map((_, i) => ({ id: i + 1, verdict: "n-a", reason: "none" }))), rules);
+    expect(r.rule_pass).toBeNull();
+  });
+
+  test("rejects missing rules, bad verdicts and empty reasons", () => {
+    expect(() => parseRuleJudgement(reply([{ id: 1, verdict: "meets", reason: "x" }]), rules)).toThrow("rule 2 is missing");
+    expect(() => parseRuleJudgement(reply(rules.map((_, i) => ({ id: i + 1, verdict: "maybe", reason: "x" }))), rules)).toThrow("bad verdict");
+    expect(() => parseRuleJudgement(reply(rules.map((_, i) => ({ id: i + 1, verdict: "meets", reason: " " }))), rules)).toThrow("no reason");
+    expect(() => parseRuleJudgement("{}", rules)).toThrow("no rules array");
+  });
+
+  test("reads rules from the profile text and drops sources", () => {
+    const profile = "# Design Memory profile\n\n### Feel\n\n- **Prefer:** One accent  _(source: direct statement: x; pref_1)_\n- **Avoid:** Template look  _(source: y)_\n- not a rule\n";
+    expect(parseProfileRules(profile)).toEqual(["Prefer: One accent", "Avoid: Template look"]);
+  });
+
+  test("html prep strips comments, puts styles first and truncates", () => {
+    const html = `<html><body><!-- rule: shadows --><div>hi</div><script>// meets rule\nlet a = "https://x.y";</script><style>/* note */ .a{color:red}</style></body></html>`;
+    const out = prepareHtml(html);
+    expect(out).not.toContain("rule");
+    expect(out).not.toContain("note");
+    expect(out).toContain("https://x.y");
+    expect(out.indexOf("<style>")).toBeLessThan(out.indexOf("<div>"));
+    expect(out.indexOf("<div>")).toBeLessThan(out.indexOf("<script>"));
+    expect(prepareHtml("x".repeat(50), 10)).toContain("truncated 40 characters");
+  });
+});
+
+describe("judge scale", () => {
+  test("accepts 0 and 10", () => {
+    const j = (n: number) => JSON.stringify(Object.fromEntries(["layout", "density", "typography", "color", "components", "detail", "overall"].map(k => [k, { score: n, reason: "r" }])));
+    expect(parseJudgement(j(0)).overall.score).toBe(0);
+    expect(parseJudgement(j(10)).overall.score).toBe(10);
+  });
+});
+
+describe("candidate lint", () => {
+  const skill = "---\nname: taste-use\ndescription: x\n---\n\nRead [a](references/study-a-reference.md).\n";
+  const files = { "references/study-a-reference.md": "See [aspects](aspects.md).", "references/aspects.md": "ok" };
+
+  test("a clean candidate passes", () => {
+    expect(lintCandidate({ skill, files, banned: ["Stripe"], maxSkillLines: 90 })).toEqual([]);
+  });
+
+  test("flags frontmatter, length, banned words, hex colors and broken links", () => {
+    const problems = lintCandidate({
+      skill: `${"line\n".repeat(100)}see stripe and #12ab9f and [x](references/nope.md)`,
+      files, banned: ["Stripe"], maxSkillLines: 90,
+    });
+    expect(problems.join("\n")).toContain("frontmatter");
+    expect(problems.join("\n")).toContain("lines (max 90)");
+    expect(problems.join("\n")).toContain("Stripe");
+    expect(problems.join("\n")).toContain("hex color");
+    expect(problems.join("\n")).toContain("broken link: SKILL.md -> references/nope.md");
+  });
+});
+
+describe("args", () => {
+  test("run accepts --skill-dir", () => {
+    expect(parseRunArgs(["--skill-dir", "x"]).skillDir).toBe("x");
+    expect(parseRunArgs([]).skillDir).toBeNull();
+  });
+
+  test("optimize defaults and overrides", () => {
+    expect(parseOptimizeArgs([])).toMatchObject({ rounds: 5, samples: 2, budgetUsd: 45, holdoutSamples: 2, trainTargets: null });
+    expect(parseOptimizeArgs(["--rounds", "1", "--samples", "1", "--train-targets", "a,b"])).toMatchObject({ rounds: 1, holdoutSamples: 1, trainTargets: ["a", "b"] });
+    expect(() => parseOptimizeArgs(["--bogus", "1"])).toThrow("unknown flag");
+  });
+});

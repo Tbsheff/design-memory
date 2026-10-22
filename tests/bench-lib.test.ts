@@ -70,7 +70,7 @@ describe("judge parsing", () => {
     const j = JSON.parse(judgeJson(3)) as Record<string, { score: unknown; reason: unknown }>;
     expect(() => parseJudgement("no json here")).toThrow("no JSON");
     expect(() => parseJudgement(JSON.stringify({ ...j, color: undefined }))).toThrow("color is missing");
-    expect(() => parseJudgement(JSON.stringify({ ...j, layout: { score: 6, reason: "x" } }))).toThrow("bad score");
+    expect(() => parseJudgement(JSON.stringify({ ...j, layout: { score: 11, reason: "x" } }))).toThrow("bad score");
     expect(() => parseJudgement(JSON.stringify({ ...j, layout: { score: 2.5, reason: "x" } }))).toThrow("bad score");
     expect(() => parseJudgement(JSON.stringify({ ...j, detail: { score: 3, reason: " " } }))).toThrow("no reason");
   });

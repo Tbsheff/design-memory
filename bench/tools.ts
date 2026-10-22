@@ -1,5 +1,5 @@
 import { Database } from "bun:sqlite";
-import { cpSync, existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Target } from "./lib.ts";
@@ -174,11 +174,23 @@ export async function sanitizedTasteHome(dest: string, targets: Target[]) {
   return { removed_refs: rows.map(r => r.id), removed_files: skip.size, preferences_mentioning_targets: leftover };
 }
 
-export function tastePlugin(dir: string): string {
-  mkdirSync(join(dir, ".claude-plugin"), { recursive: true });
-  mkdirSync(join(dir, "skills"), { recursive: true });
-  writeFileSync(join(dir, ".claude-plugin/plugin.json"), JSON.stringify({ name: "bench-taste", version: "0.0.1", description: "Only the taste-use skill, for the design rebuild benchmark" }));
+export const SKILL_FILES = ["SKILL.md", "references/study-a-reference.md", "references/review-implementation.md", "references/aspects.md", "references/memory-policy.md"];
+
+function sameSkillFiles(a: string, b: string): boolean {
+  return SKILL_FILES.every(f => existsSync(join(a, f)) && existsSync(join(b, f)) && readFileSync(join(a, f), "utf8") === readFileSync(join(b, f), "utf8"));
+}
+
+export function tastePlugin(dir: string, skillDir: string | null = null, reuse = false): string {
   const skill = join(dir, "skills/taste-use");
-  if (!existsSync(skill)) cpSync(TASTE_SKILL, skill, { recursive: true, dereference: true });
+  if (existsSync(skill) && reuse && sameSkillFiles(skill, skillDir ?? TASTE_SKILL)) return skill;
+  if (existsSync(skill)) throw new Error(`taste plugin already exists at ${skill}; use a fresh --out for each skill version`);
+  mkdirSync(join(dir, ".claude-plugin"), { recursive: true });
+  writeFileSync(join(dir, ".claude-plugin/plugin.json"), JSON.stringify({ name: "bench-taste", version: "0.0.1", description: "Only the taste-use skill, for the design rebuild benchmark" }));
+  cpSync(TASTE_SKILL, skill, { recursive: true, dereference: true });
+  if (!skillDir) return skill;
+  for (const file of SKILL_FILES) {
+    if (!existsSync(join(skillDir, file))) throw new Error(`--skill-dir ${skillDir} has no ${file}`);
+    cpSync(join(skillDir, file), join(skill, file));
+  }
   return skill;
 }

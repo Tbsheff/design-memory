@@ -12,7 +12,7 @@ Real UI designs posted on X are the answer key. An agent gets a short, plain pro
 
 ```bash
 bun bench/run.ts [--targets id,id] [--modes baseline,taste,reference] [--samples N] \
-  [--model sonnet] [--concurrency 3] [--out bench/runs/<timestamp>] [--timeout-minutes 20] [--budget-usd 5]
+  [--model sonnet] [--concurrency 3] [--out bench/runs/<timestamp>] [--timeout-minutes 20] [--budget-usd 5] [--skill-dir PATH]
 bun bench/score.ts --run bench/runs/<ts> [--judge-model opus] [--concurrency 3] [--force]
 bun bench/report.ts --run bench/runs/<ts>
 ```
@@ -22,7 +22,10 @@ Output per build: `runs/<ts>/<target>/<mode>/<sample>/{index.html,build.png,meta
 - `run.ts` makes a fresh empty temp directory for each build, runs headless Claude Code there, copies out `index.html`, and renders `build.png` with headless Chrome at 1440 px wide and the target's aspect ratio (no full page). `meta.json` records cost, duration, turns, tools used, tool errors, and for taste mode whether the skill loaded (`skill_used`) and how many `taste` CLI calls ran.
 - `score.ts` scores each build two ways:
   - Pixels: target and build are resized to 720 px wide. `ssim` is mean SSIM over 8×8 windows (stride 4) on grayscale, 1 = same. `histogram_distance` is 1 − intersection of 8×8×8 RGB histograms, 0 = same colors. ImageMagick does the resize and pixel export; SSIM is computed in `lib.ts` instead of `magick compare`. In ImageMagick 7.1.1-47, `-metric SSIM` returns 0 for identical images, which looks like the distortion form (1 − SSIM). `-metric DSSIM` returns 1 for identical images, which is wrong for a dissimilarity. The two numbers also do not agree for different images, so neither one is used.
-  - Judge: a headless `claude -p` with the same isolation as baseline and only the Read tool. It runs in a neutral temp directory that holds `1-target.jpg` and `2-build.png`, so it never sees the mode. It returns strict JSON with 1–5 scores and a one-line reason for layout, density, typography, color, components, detail and overall. The rubric is `JUDGE_PROMPT` in `lib.ts`. One retry runs if the JSON does not parse.
+  - Judge: a headless `claude -p` with the same isolation as baseline and only the Read tool. It runs in a neutral temp directory that holds `1-target.jpg` and `2-build.png`, so it never sees the mode. It returns strict JSON with 0–10 scores and a one-line reason for layout, density, typography, color, components, detail and overall. The rubric is `JUDGE_PROMPT` in `lib.ts`. One retry runs if the JSON does not parse.
+  - Rule judge: a second isolated `claude -p` per build gets `2-build.png`, the HTML (comments removed, `<style>` first, `<script>` last, cut at 40,000 characters) and the profile rules. It marks each rule `meets`, `misses` or `n-a` with a reason. `rule_pass = meets / (meets + misses)`; it is null when no rule applies. Rules come from `taste profile` against the run's cleaned library and are saved to `<run>/rules.json`. The judge also sees no mode, but baseline builds are judged against the same rules.
+  - Objective: `score = 0.7 × overall / 10 + 0.3 × rule_pass` per build. A build that wrote no page scores 0. When `rule_pass` is null, the score is `overall / 10`. A build whose judge failed twice is left out.
+  - The judge used a 1–5 scale until `full-2`, where 7 of 8 taste builds tied with baseline at 3. Old `score.json` files have no `judge_scale: 10`, so `score.ts` scores them again on the next run (no rebuild). Re-scoring costs about $0.2 per build.
 - `report.ts` writes `report.html` (mode table, win counts, then every target with each build side by side) and `blind.html`.
 - `blind.html` shows the target and the taste and baseline builds in a seeded random left/right order. Press 1 / 2 / 3 or click. Picks stay in localStorage; **Export JSON** downloads them; the totals show after the last pick. Serve the run folder or open the file directly; images use relative paths.
 
@@ -42,7 +45,7 @@ claude -p <prompt> --output-format json --verbose --model <m>
 | Mode | `--tools` | `--allowedTools` | Extra |
 |------|-----------|------------------|-------|
 | baseline, reference | `Read,Write,Edit,Skill` | same | – |
-| taste | `Read,Write,Edit,Skill,Bash` | same, but Bash only as `Bash(taste *)`, `Bash(*/scripts/taste *)` | `--plugin-dir` and `--add-dir <run>/.taste-plugin` (a one-skill plugin with a copy of `~/.agents/skills/taste-use`), `--settings` with a PreToolUse hook (`taste-hook.ts`), `DESIGN_MEMORY_HOME=<run>/.taste-home` |
+| taste | `Read,Write,Edit,Skill,Bash` | `Write,Edit,Skill`; Read only as `Read(/<run>/.taste-home/media/**)` and `thumbs/**` (plus cwd and the plugin folder, which are working directories); Bash only as `Bash(taste *)`, `Bash(*/scripts/taste *)` | `--plugin-dir` and `--add-dir <run>/.taste-plugin` (a one-skill plugin with a copy of `~/.agents/skills/taste-use`), `--settings` with a PreToolUse hook (`taste-hook.ts`), `DESIGN_MEMORY_HOME=<run>/.taste-home` |
 | judge | `Read` | `Read` | – |
 
 Why these flags:
@@ -73,6 +76,14 @@ Probe with the hook: the `S=…; $S profile; $S brief …` form and the `cd <ski
 
 `meta.json` records each Bash call with its result (`bash`), `taste_calls` (attempts) and `taste_ok_calls` (calls that returned profile or brief text). The report counts a taste build as "taste data loaded" only when `taste_ok_calls > 0`. Every build also saves `transcript.json`, the raw Claude output.
 
+### Read scope
+
+A bare `Read` allow reaches any file, the answer key in `bench/targets/` too (probe: a headless call with `--allowedTools Read` read `bench/targets/agent-runs-dark.jpg`). Taste mode now allows Read only on the cleaned library's `media/` and `thumbs/`, so a skill may tell the builder to open saved screenshots that `taste brief` or `taste show` list. Probe with the taste flags: cwd file, plugin `references/aspects.md` and a library image were read; `bench/targets/agent-runs-dark.jpg` was denied. The media dir is not an `--add-dir`, because `acceptEdits` would also accept writes there. Baseline and reference keep bare `Read`; they get no file paths in their prompt.
+
+### Skill dir
+
+`--skill-dir PATH` loads `SKILL.md` and `references/{study-a-reference,review-implementation,aspects,memory-policy}.md` from PATH over the plugin's copy of the installed skill (scripts and the other references stay). Each run makes its own plugin copy and fails if one already exists, so two skill versions never share a run folder.
+
 ## Answer-key leakage
 
 Two targets (`mrr-metrics-light`, `customer-table-dark`) were saved in the taste library as references. Each run makes a cleaned snapshot in `<run>/.taste-home`: `sqlite3 VACUUM INTO` copies the database, then the refs whose source matches any target post are deleted with their observations, feedback, project links, FTS rows and media files. `run.json` → `taste_home` lists what was removed. Confirmed preferences stay; none of them mention a target post. Other posts by the same authors stay in the library. That is a soft bias toward their style in taste mode, not the answer key.
@@ -94,11 +105,36 @@ The images belong to their authors. They are kept here only for private benchmar
 | agent-runs-dark | @Karthik_designs | https://x.com/Karthik_designs/status/2112891659507896372 |
 | finance-dashboard-light | @_heyrico | https://x.com/_heyrico/status/2111857856916201877 |
 
+## Train and holdout
+
+`targets.json` gives each target a `split`. Holdout: `customer-table-dark` (dark), `finance-dashboard-light` (light dashboard) and `invoice-exception-detail` (detail page). The first two come from authors with no other target. Train: the other five. `client-detail-light` (train) and `invoice-exception-detail` (holdout) share an author, so holdout is not fully independent of train style. The cleaned library still removes the answer-key posts of all eight targets.
+
+## Optimizer
+
+```bash
+bun bench/optimize.ts --rounds 5 --samples 2 --budget-usd 45 \
+  [--holdout-samples N] [--train-targets id,id] [--holdout-targets id,id] [--model sonnet] [--judge-model opus] \
+  [--proposer-model opus] [--concurrency 5] [--build-budget-usd 5] [--out bench/optimize/<timestamp>]
+```
+
+It improves copies of the taste-use skill (`skills/taste-use/SKILL.md` and the four references). It never edits the repo files.
+
+1. Round 0 copies the repo skill to `<out>/original/` and evaluates it on train (taste mode). That result is the cached incumbent.
+2. Each round, a proposer (`claude -p`, opus) runs in a fresh temp folder that holds only `skill/` (editable) and `feedback/`: train judge reasons and rule misses per build, labeled `case-N`, the most-missed rules, side-by-side PNGs (target | build) of the 3 worst builds, and earlier proposals with their verdicts and rejected diffs. Read is allowed only in that folder, and Edit and Write only in `skill/`. Probe: it could not read `bench/targets/` or `bench/runs/`, nor write outside the folder. It never sees holdout images, reasons or names.
+3. Before it spends money, a lint rejects a candidate with no edits, a changed `name: taste-use` frontmatter, more than 95 lines in SKILL.md, a hex color, a broken reference link, or a target id, author or product name.
+4. The candidate is evaluated on train. Acceptance compares per-target means paired with the incumbent: accept when the mean paired gain is at least 0.02 and greater than its standard error. Paired differences remove the spread between targets, which is larger than the effect we look for.
+5. The loop stops after `--rounds`, after 2 rejections in a row, or when spent + the largest round so far + a holdout reserve passes `--budget-usd`.
+6. Holdout: baseline, the original skill and the best skill, `--holdout-samples` each. `<out>/final.json` and `<out>/report.html` show the holdout table, the round table and the skill diff (original → best).
+
+Output: `<out>/history.json` (round, diff, lint, train score ± se, comparison, accepted, cost), `<out>/round-k/{candidate,feedback,proposer-transcript.json}`, `<out>/evals/<name>/` (normal run folders). `bench/optimize/` is git-ignored.
+
+Caveat: the incumbent's cached score is the one that won selection, so it is biased upward. Later candidates must beat a lucky number, and early stops are more likely. Only holdout is a fair estimate.
+
 ## Caveats
 
 - Most targets sit on a gray backdrop inside a rounded frame. Builds usually fill the page, so SSIM and the histogram partly measure the frame. Reference builds often copy the frame too. The judge is told to ignore the frame.
 - `agent-runs-dark` is a zoomed crop with the sidebar cut off. Its prompt asks for that crop.
 - The taste-use skill asks the agent to look at the rendered UI before it finishes. No mode can run a browser (agents try Chrome and are denied), so taste builds skip that step.
-- The judge's 1–5 integer scale is coarse. In `full-2`, all 8 baseline builds got overall 3, and 7 of 8 taste builds did too. Use SSIM, the dimension scores, and `blind.html` alongside it.
+- The judge's old 1–5 integer scale was coarse. In `full-2`, all 8 baseline builds got overall 3, and 7 of 8 taste builds did too. The 0–10 scale replaces it; still use SSIM, the dimension scores, and `blind.html` alongside it.
 - A reference build can look worse than the prompt-only builds when its layout breaks. In `full-2`, `client-detail-light` reference overlaps its own sidebar, so the judge gave it 2 even though its SSIM is high. No mode looks at its own render.
 - One sample per cell is noisy. Use `--samples 3` or more before you trust a small difference.

@@ -4,7 +4,8 @@ export const DIMENSIONS = ["layout", "density", "typography", "color", "componen
 export type Dimension = (typeof DIMENSIONS)[number];
 export type Judgement = Record<Dimension, { score: number; reason: string }>;
 
-export type Target = { id: string; image: string; source_url: string; author: string; prompt: string; width: number; height: number };
+export type Split = "train" | "holdout";
+export type Target = { id: string; image: string; source_url: string; author: string; prompt: string; width: number; height: number; split?: Split };
 
 export type RunOptions = {
   targets: string[] | null;
@@ -15,6 +16,7 @@ export type RunOptions = {
   out: string | null;
   timeoutMinutes: number;
   budgetUsd: number;
+  skillDir: string | null;
 };
 
 export type ScoreOptions = { run: string; judgeModel: string; concurrency: number; force: boolean };
@@ -29,7 +31,16 @@ export type BuildScore = {
   histogram_distance?: number;
   judge?: Judgement;
   judge_cost_usd?: number;
+  judge_scale?: number;
+  rules?: RuleSummary;
+  rules_cost_usd?: number;
+  objective?: number | null;
 };
+
+export const RULE_VERDICTS = ["meets", "misses", "n-a"] as const;
+export type RuleVerdict = (typeof RULE_VERDICTS)[number];
+export type RuleResult = { rule: string; verdict: RuleVerdict; reason: string };
+export type RuleSummary = { results: RuleResult[]; meets: number; misses: number; na: number; rule_pass: number | null };
 
 export const VIEWPORT_WIDTH = 1440;
 
@@ -81,7 +92,7 @@ export function parseModes(value: string | undefined): Mode[] {
   return [...new Set(items)] as Mode[];
 }
 
-const RUN_FLAGS = new Set(["targets", "modes", "samples", "model", "concurrency", "out", "timeout-minutes", "budget-usd"]);
+const RUN_FLAGS = new Set(["targets", "modes", "samples", "model", "concurrency", "out", "timeout-minutes", "budget-usd", "skill-dir"]);
 
 function rejectUnknown(flags: Map<string, string>, known: Set<string>) {
   const unknown = [...flags.keys()].filter(k => !known.has(k));
@@ -100,6 +111,7 @@ export function parseRunArgs(argv: string[]): RunOptions {
     out: flags.get("out") ?? null,
     timeoutMinutes: positive(flags.get("timeout-minutes"), 20, "timeout-minutes"),
     budgetUsd: positive(flags.get("budget-usd"), 5, "budget-usd"),
+    skillDir: flags.get("skill-dir") ?? null,
   };
 }
 
@@ -149,7 +161,7 @@ export const JUDGE_PROMPT = `You compare a UI build against a target design. Two
 
 Read 1-target.jpg first, then 2-build.png. Ignore any gray backdrop, device frame or drop shadow around the target; compare the app screen itself. Do not reward or punish the exact sample text or numbers; judge the visual design.
 
-Score each field from 1 to 5 (integers only):
+Score each field from 0 to 10 (integers only):
 - layout: regions, their placement, proportions and alignment.
 - density: amount of content per area, spacing and whitespace rhythm.
 - typography: type families, sizes, weights, hierarchy, numeric styling.
@@ -158,17 +170,20 @@ Score each field from 1 to 5 (integers only):
 - detail: borders, radius, shadows, icons, dividers, small finishing touches.
 - overall: how close the build looks to the target as a whole.
 
-Scale for every field:
-5 = indistinguishable from the target at a glance.
-4 = clearly the same design; small differences only on close look.
-3 = same kind of screen and structure, but visibly different styling or proportions.
+Scale for every field (use the odd numbers between the anchors too):
+10 = indistinguishable from the target at a glance.
+8 = clearly the same design; small differences only on close look.
+6 = same kind of screen and structure, with several styling or proportion choices that match the target.
+4 = same kind of screen and structure, but visibly different styling or proportions.
 2 = same product idea, but a different design.
-1 = a different product or a broken or empty page.
+0 = a different product or a broken or empty page.
 
 Reply with ONLY one JSON object, no prose and no code fence, in exactly this shape:
-{"layout":{"score":3,"reason":"one line"},"density":{"score":3,"reason":"one line"},"typography":{"score":3,"reason":"one line"},"color":{"score":3,"reason":"one line"},"components":{"score":3,"reason":"one line"},"detail":{"score":3,"reason":"one line"},"overall":{"score":3,"reason":"one line"}}`;
+{"layout":{"score":5,"reason":"one line"},"density":{"score":5,"reason":"one line"},"typography":{"score":5,"reason":"one line"},"color":{"score":5,"reason":"one line"},"components":{"score":5,"reason":"one line"},"detail":{"score":5,"reason":"one line"},"overall":{"score":5,"reason":"one line"}}`;
 
-function extractJsonObject(text: string): unknown {
+export const JUDGE_SCALE = 10;
+
+export function extractJsonObject(text: string): unknown {
   const start = text.indexOf("{");
   const end = text.lastIndexOf("}");
   if (start < 0 || end <= start) throw new Error("no JSON object in judge reply");
@@ -179,7 +194,7 @@ function validField(name: string, value: unknown): { score: number; reason: stri
   const field = value as { score?: unknown; reason?: unknown } | null;
   if (!field || typeof field !== "object") throw new Error(`judge field ${name} is missing`);
   const score = field.score;
-  if (typeof score !== "number" || !Number.isInteger(score) || score < 1 || score > 5) throw new Error(`judge field ${name} has bad score: ${String(score)}`);
+  if (typeof score !== "number" || !Number.isInteger(score) || score < 0 || score > JUDGE_SCALE) throw new Error(`judge field ${name} has bad score: ${String(score)}`);
   if (typeof field.reason !== "string" || !field.reason.trim()) throw new Error(`judge field ${name} has no reason`);
   return { score, reason: field.reason.trim() };
 }
@@ -206,15 +221,17 @@ export function round(value: number, places = 4): number {
   return Math.round(value * f) / f;
 }
 
-type Metric = "ssim" | "histogram_distance" | Dimension;
+type Metric = "ssim" | "histogram_distance" | "rule_pass" | "objective" | Dimension;
 
 function metricValue(score: BuildScore, metric: Metric): number {
   if (metric === "ssim") return score.ssim ?? NaN;
   if (metric === "histogram_distance") return score.histogram_distance ?? NaN;
+  if (metric === "rule_pass") return score.rules?.rule_pass ?? NaN;
+  if (metric === "objective") return score.objective ?? NaN;
   return score.judge?.[metric].score ?? NaN;
 }
 
-const METRICS: Metric[] = ["ssim", "histogram_distance", ...DIMENSIONS];
+const METRICS: Metric[] = ["objective", "rule_pass", "ssim", "histogram_distance", ...DIMENSIONS];
 
 function metricStats(scores: BuildScore[]) {
   const ok = scores.filter(s => s.ok);

@@ -40,12 +40,12 @@ function modeRow(mode: Mode, builds: Build[]): string {
   const dims = DIMENSIONS.filter(d => d !== "overall").map(d => `<td>${fmt(mean(s => s.judge?.[d].score)?.mean)}</td>`).join("");
   const cost = mine.reduce((a, b) => a + (b.meta.cost_usd ?? 0), 0);
   const skill = mode === "taste" ? `${mine.filter(b => b.meta.skill_used && (b.meta.taste_ok_calls ?? 0) > 0).length}/${mine.length}` : "–";
-  return `<tr><td>${mode}</td><td>${mine.length}</td><td>${mine.length - scored.length}</td><td><b>${fmt(overall?.mean)}</b> ± ${fmt(overall?.sd)}</td>${dims}<td>${fmt(mean(s => s.ssim)?.mean, 3)}</td><td>${fmt(mean(s => s.histogram_distance)?.mean, 3)}</td><td>$${fmt(cost)}</td><td>${fmt(stats(mine.map(b => b.meta.num_turns ?? NaN))?.mean, 1)}</td><td>${skill}</td></tr>`;
+  return `<tr><td>${mode}</td><td>${mine.length}</td><td>${mine.length - scored.length}</td><td><b>${fmt(overall?.mean)}</b> ± ${fmt(overall?.sd)}</td><td>${fmt(mean(s => s.rules?.rule_pass ?? undefined)?.mean, 3)}</td><td>${fmt(mean(s => s.objective ?? undefined)?.mean, 3)}</td>${dims}<td>${fmt(mean(s => s.ssim)?.mean, 3)}</td><td>${fmt(mean(s => s.histogram_distance)?.mean, 3)}</td><td>$${fmt(cost)}</td><td>${fmt(stats(mine.map(b => b.meta.num_turns ?? NaN))?.mean, 1)}</td><td>${skill}</td></tr>`;
 }
 
 function modeTable(builds: Build[]): string {
   const dimHeads = DIMENSIONS.filter(d => d !== "overall").map(d => `<th>${d}</th>`).join("");
-  return `<table><thead><tr><th>Mode</th><th>Builds</th><th>Failed</th><th>Overall (1–5)</th>${dimHeads}<th>SSIM</th><th>Hist dist</th><th>Build cost</th><th>Turns</th><th>Taste data loaded</th></tr></thead><tbody>${MODES.map(m => modeRow(m, builds)).join("")}</tbody></table>`;
+  return `<table><thead><tr><th>Mode</th><th>Builds</th><th>Failed</th><th>Overall (0–10)</th><th>Rule pass</th><th>Objective</th>${dimHeads}<th>SSIM</th><th>Hist dist</th><th>Build cost</th><th>Turns</th><th>Taste data loaded</th></tr></thead><tbody>${MODES.map(m => modeRow(m, builds)).join("")}</tbody></table>`;
 }
 
 function overallFor(builds: Build[], target: string, mode: Mode): number | undefined {
@@ -76,7 +76,7 @@ function buildCell(build: Build | undefined, mode: Mode): string {
   const label = `<p class="label">${mode} #${build.meta.sample}<small>$${fmt(build.meta.cost_usd)} · ${build.meta.num_turns ?? "–"} turns${extra}</small></p>`;
   if (!build.meta.ok) return `<div class="cell">${label}<p class="fail">${esc(build.meta.error)}</p></div>`;
   const dims = s?.judge ? DIMENSIONS.filter(d => d !== "overall").map(d => `${d} ${s.judge![d].score}`).join(" · ") : esc(s?.error ?? "not scored");
-  return `<div class="cell">${label}<a href="${build.rel}/index.html"><img loading="lazy" src="${build.rel}/build.png" alt="${mode} build"></a><div class="dims"><span class="big">${s?.judge?.overall.score ?? "–"}</span> overall · SSIM ${fmt(s?.ssim, 3)} · hist ${fmt(s?.histogram_distance, 3)}<br>${dims}</div>${s ? judgeDetails(s) : ""}</div>`;
+  return `<div class="cell">${label}<a href="${build.rel}/index.html"><img loading="lazy" src="${build.rel}/build.png" alt="${mode} build"></a><div class="dims"><span class="big">${s?.judge?.overall.score ?? "–"}</span> overall · rules ${fmt(s?.rules?.rule_pass, 2)} · SSIM ${fmt(s?.ssim, 3)} · hist ${fmt(s?.histogram_distance, 3)}<br>${dims}</div>${s ? judgeDetails(s) : ""}</div>`;
 }
 
 function targetSection(target: Target, builds: Build[]): string {
