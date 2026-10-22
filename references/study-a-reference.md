@@ -1,6 +1,6 @@
-# Design interpretation — evidence before taste
+# Study a reference — evidence before taste
 
-Read this only when studying a reference or applying one to a UI.
+Read this only when studying a saved reference or applying one to a UI.
 
 ## Extract the smallest transferable ideas
 
@@ -13,7 +13,9 @@ Read this only when studying a reference or applying one to a UI.
 7. **Interaction** — Only call out animations, transitions, or behavior you actually observed, never infer them from a still image.
 8. **Trade-off** — Which design goal benefited, and what cost (readability, scanning, mobile, discoverability) might follow?
 
-Use this compact description format:
+Name each idea with a term from [aspects.md](aspects.md) so it lines up with the user's feedback.
+
+## Describe it compactly
 
 - **Observed:** A detail you can point to in the image/source.
 - **Effect:** Why that detail matters for the task.
@@ -24,14 +26,12 @@ Bad: "Modern, premium, clean, intuitive UX."
 
 Good: "The filter row shares one baseline and uses short control labels. This keeps the table's header visually dominant; useful for a dense worklist, but not proof that mobile filters work."
 
-For a shadcn component URL, separate **the component's behavior/API** from **a specific demo's visual styling**. The user may like the interaction without liking its spacing or colors. For an X post, don't mistake descriptive text for a verified visual behavior; preserve the URL when content is blocked.
+## Source types
+
+- **shadcn component URL:** separate the component's behavior/API from a specific demo's visual styling. The user may like the interaction without liking its spacing or colors.
+- **X post:** don't mistake descriptive text for a verified visual behavior. `taste add` stores the post text and images; preserve the URL when content is blocked.
+- **Website link without a screenshot:** you have not seen it. Ask for a screenshot before describing it.
+
+## Combine, don't copy
 
 For mixed references, synthesize: "take the hierarchy of A, the compact tables of B, and the animation restraint of C" rather than copying any one screenshot.
-
-## Review the implementation
-
-1. Compare the screenshot of the real implementation with the source reference and the user's current constraints.
-2. Flag up to five concrete mismatches, sorted by impact.
-3. Include loading, error, empty, narrow-screen, and keyboard states if the scope calls for them.
-4. Ask about the one most consequential uncertain aspect. Record only the answer given.
-5. Never turn the agent's own aesthetic judgment into a user preference.

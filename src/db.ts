@@ -19,9 +19,18 @@ export type Reference = {
 };
 export type Observation = { id: string; ref_id: string; aspect: string; detail: string; evidence: string; effect: string; certainty: "observed" | "inferred"; created_at: string };
 export type Feedback = { id: string; ref_id: string; aspect: string; vote: "like" | "dislike" | "mixed"; reason: string; quote: string; project: string | null; created_at: string };
-export type Preference = { id: string; kind: "prefer" | "avoid"; rule: string; scope: "global" | "project"; project: string | null; feedback_ids: string[]; statement: string; created_at: string };
+export type Preference = { id: string; kind: "prefer" | "avoid"; rule: string; scope: "global" | "project"; project: string | null; feedback_ids: string[]; statement: string; created_at: string; area?: string };
 export type Table = "refs" | "observations" | "feedback" | "preferences";
 export type RecordByTable = { refs: Reference; observations: Observation; feedback: Feedback; preferences: Preference };
+export const AREAS = ["feel", "layout", "surfaces", "type", "color", "motion", "behavior", "writing"] as const;
+export type Area = typeof AREAS[number];
+export const areaLabel = (area: string) => area.charAt(0).toUpperCase() + area.slice(1);
+export function groupByArea<T extends { area?: string }>(items: T[]): { label: string; items: T[] }[] {
+  const known = (item: T) => (AREAS as readonly string[]).includes(item.area ?? "");
+  const groups = AREAS.map(area => ({ label: areaLabel(area), items: items.filter(item => item.area === area) }));
+  groups.push({ label: "Other", items: items.filter(item => !known(item)) });
+  return groups.filter(group => group.items.length);
+}
 export const now = () => new Date().toISOString();
 export const itemId = (prefix: string) => `${prefix}_${randomBytes(6).toString("hex")}`;
 export const encode = (obj: unknown) => JSON.stringify(obj);

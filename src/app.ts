@@ -6,7 +6,7 @@ import { extname, join } from "node:path";
 import { createHash, randomBytes } from "node:crypto";
 import { spawn } from "node:child_process";
 import { addOne } from "./main.ts";
-import { ensureFts, getItem, inTransaction, itemId, now, records, refreshSearch, saveRecord } from "./db.ts";
+import { ensureFts, getItem, groupByArea, inTransaction, itemId, now, records, refreshSearch, saveRecord } from "./db.ts";
 import type { Reference, Feedback, Preference } from "./db.ts";
 import { appHTML } from "./app-template.ts";
 import { finalizeUploadedMedia } from "./media.ts";
@@ -125,9 +125,9 @@ function referenceDetail(db:Database, id:string) {
 }
 function profilePrompt(db:Database, project:string): string {
   const lines=["My design preferences (explicitly confirmed):"];
-  for (const p of preferenceList(db) as Preference[]) {
-    if (p.scope!=="global" && p.project!==project) continue;
-    lines.push(`- ${p.kind==="prefer"?"Prefer":"Avoid"}${p.scope==="project"?` in ${p.project}`:""}: ${p.rule}`);
+  const prefs=(preferenceList(db) as Preference[]).filter(p=>p.scope==="global" || p.project===project);
+  for (const group of groupByArea(prefs)) {
+    lines.push(`${group.label}:`, ...group.items.map(p=>`- ${p.kind==="prefer"?"Prefer":"Avoid"}${p.scope==="project"?` in ${p.project}`:""}: ${p.rule}`));
   }
   return lines.join("\n");
 }

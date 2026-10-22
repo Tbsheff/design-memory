@@ -14,11 +14,11 @@ A saved item can illustrate several conflicting choices: a user may like its nav
 
 ## Learning process
 
-1. Group feedback by the underlying design choice, not solely shared keywords.
+1. Group feedback by the underlying design choice, not solely shared keywords. Name aspects with [aspects.md](aspects.md) so groups line up.
 2. Find positive and negative examples, look for context and contradictions.
 3. Propose one short, testable reusable rule with scope and exceptions.
 4. Confirm it with the user unless they already explicitly asked you to remember it.
-5. Save the preference with evidence IDs; leave anything unresolved as a candidate.
+5. Save the preference with evidence IDs and an `--area`; leave anything unresolved as a candidate.
 6. When the user changes their mind, retire and replace, never silently reinterpret old feedback.
 
 The executable CLI does not run models. Learning is agent-assisted and user-confirmed. This prevents random attractive screenshots from overwriting an established profile.

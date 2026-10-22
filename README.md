@@ -47,12 +47,13 @@ The service is a launchd agent (`~/Library/LaunchAgents/dev.taste.workspace.plis
 
 A note or saved URL is **not automatically a lasting preference**. Feedback and confirmed preferences are separate. Websites are never fetched. X post links are the one exception: `taste add` reads the post's text and images from X's public embed endpoint (`cdn.syndication.twimg.com`) and stores them locally. Use `--fetch no` to save only the link. For private or deleted posts, or for sites, include a screenshot.
 
-## Two agent skills
+## Three agent skills
 
 The installer creates independently discoverable skills:
 
 - **`taste-add`** — use for screenshots, URLs, shadcn components, X posts, and explicit likes/dislikes. Say *"Save this. I like how dense this table is."* The agent saves the source and feedback.
-- **`taste-use`** — use when implementing or reviewing UI. Say *"Build the QA dashboard using my saved taste."* The agent retrieves the confirmed profile and a small set of relevant references.
+- **`taste-define`** — use to work out your overall taste. Say *"Define my taste with me."* The agent looks at your saves, asks about qualities and feelings, and saves only the rules you pick, each with an area.
+- **`taste-use`** — use when implementing or reviewing UI. Say *"Build the QA dashboard using my saved taste."* The agent retrieves the confirmed profile and a small set of relevant references, then checks the finished UI against each rule before it reports done.
 
 The agent skills call **the same Bun CLI and the same SQLite library**, without running the visual workspace. Installation does not force preferences into every agent conversation.
 
@@ -65,7 +66,8 @@ TASTE="$HOME/.agents/skills/design-memory/scripts/taste"
 "$TASTE" add 'https://x.com/example/status/12345' --note 'Navigation pattern'
 "$TASTE" search 'compact tables' --limit 8
 "$TASTE" brief --topic 'settings page' --project bonaparte --limit 6
-"$TASTE" profile --project bonaparte
+"$TASTE" profile --project bonaparte    # rules grouped by area
+"$TASTE" area pref_ID layout            # set a rule's area
 "$TASTE" open                         # editable visual UI, on-demand
 "$TASTE" gallery                      # static read-only HTML export
 ```
@@ -77,12 +79,14 @@ Run `taste --help` for the rest of the CLI (observation/feedback/preference comm
 ```text
 ~/.agents/skills/
   taste-add/SKILL.md          # save / annotate instructions
+  taste-define/SKILL.md       # taste interview / rules from reactions
   taste-use/SKILL.md          # retrieval / UI critique instructions
   design-memory/             # shared runtime; no active SKILL.md
     scripts/taste
     src/
 
 ~/.claude/skills/taste-add → ~/.agents/skills/taste-add
+~/.claude/skills/taste-define → ~/.agents/skills/taste-define
 ~/.claude/skills/taste-use → ~/.agents/skills/taste-use
 
 ~/.design-memory/

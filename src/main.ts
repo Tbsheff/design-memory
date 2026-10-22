@@ -8,7 +8,7 @@ import {
   addMedia,
 } from "./media.ts";
 import {
-  encode, ensureFts, getItem, inTransaction, itemId, now, records, refreshSearch,
+  AREAS, encode, ensureFts, getItem, groupByArea, inTransaction, itemId, now, records, refreshSearch,
   rootPath, saveRecord, store, expand,
 } from "./db.ts";
 import type { Kind, Reference, Preference, Feedback, Observation, Media, XPost } from "./db.ts";
@@ -27,7 +27,8 @@ Usage: taste [--root DIR] COMMAND [arguments]
   feedback ref_ID --vote like|dislike|mixed --aspect TEXT [--quote TEXT] [--reason TEXT]
   candidates [--min N]
   prefer --kind prefer|avoid --rule TEXT (--statement QUOTE | --from-feedback fb_ID)
-         [--scope global|project --project NAME]
+         [--scope global|project --project NAME] [--area AREA]
+  area pref_ID AREA   Set the area of a preference (feel|layout|surfaces|type|color|motion|behavior|writing)
   retire pref_ID --reason TEXT
   profile [--project NAME] [--output FILE]
   brief [--project NAME] [--topic TEXT] [--ref ref_ID] [--limit N] [--output FILE]
@@ -37,7 +38,7 @@ Usage: taste [--root DIR] COMMAND [arguments]
 
 Data: ~/.design-memory (override with DESIGN_MEMORY_HOME or --root)
 `;
-const VALID = new Set(["add","list","search","show","observe","feedback","candidates","prefer","retire","profile","brief","gallery","open","service"]);
+const VALID = new Set(["add","list","search","show","observe","feedback","candidates","prefer","area","retire","profile","brief","gallery","open","service"]);
 const FLAGS: Record<string, Set<string>> = {
   add: new Set(["image","note","title","tag","kind","project","fetch"]),
   list: new Set(["project","kind","tag","limit"]),
@@ -46,7 +47,8 @@ const FLAGS: Record<string, Set<string>> = {
   observe: new Set(["aspect","detail","evidence","effect","certainty"]),
   feedback: new Set(["aspect","vote","reason","quote","project"]),
   candidates: new Set(["min"]),
-  prefer: new Set(["kind","rule","scope","project","from-feedback","statement"]),
+  prefer: new Set(["kind","rule","scope","project","from-feedback","statement","area"]),
+  area: new Set(),
   retire: new Set(["reason"]),
   profile: new Set(["project","output"]),
   brief: new Set(["project","topic","ref","limit","output"]),
@@ -256,9 +258,18 @@ function cmdPrefer(db: Database, a: Arguments) {
   const linked = ids.map(id => getItem(db,"feedback",id));
   const opposite = kind === "prefer" ? "dislike" : "like";
   if (linked.length && linked.every(fb => fb.vote === opposite)) throw new Error("Feedback contradicts this preference; check --kind");
-  const item: Preference = {id:itemId("pref"),kind,rule:required(a,"rule"),scope,project,feedback_ids:ids,statement,created_at:now()};
+  const area = optionalArea(arg(a,"area"));
+  const item: Preference = {id:itemId("pref"),kind,rule:required(a,"rule"),scope,project,feedback_ids:ids,statement,created_at:now(),...(area ? {area} : {})};
   inTransaction(db, () => saveRecord(db,"preferences",item));
-  emit({id:item.id,rule:item.rule,scope:item.scope,kind:item.kind});
+  emit({id:item.id,rule:item.rule,scope:item.scope,kind:item.kind,...(area ? {area} : {})});
+}
+const optionalArea = (value: string | undefined) => value === undefined ? undefined : choose(value, AREAS, "area", "feel");
+function cmdArea(db: Database, a: Arguments) {
+  const pref = getItem(db,"preferences",first(a,"Preference ID"));
+  if (a.args.length !== 2) throw new Error("Use: taste area pref_ID AREA");
+  pref.area = choose(a.args[1], AREAS, "area", "feel");
+  inTransaction(db, () => saveRecord(db,"preferences",pref));
+  emit({id:pref.id,area:pref.area});
 }
 function cmdRetire(db: Database, a: Arguments) {
   const id = first(a,"Preference ID"); getItem(db,"preferences",id);
@@ -281,12 +292,15 @@ const prefLine = (pref: Preference) => {
   const sources = pref.feedback_ids.length ? pref.feedback_ids.join(", ") : `direct statement: ${pref.statement}`;
   return `- **${pref.kind === "prefer" ? "Prefer" : "Avoid"}:** ${pref.rule}  _(source: ${sources}; ${pref.id})_`;
 };
+const scopeLines = (prefs: Preference[], empty: string) => prefs.length
+  ? groupByArea(prefs).flatMap((group, index) => [...(index ? [""] : []), `### ${group.label}`, "", ...group.items.map(prefLine)])
+  : [empty];
 function profile(db: Database, project?: string): string {
   const prefs = activePreferences(db,project);
   const lines = ["# Design Memory profile","","Only confirmed preferences appear here. Saved references are not approval.",
     "Priority: current request > project decisions > personal preferences > inspiration.","","## Personal", ""];
-  lines.push(...(prefs.global.length ? prefs.global.map(prefLine) : ["_No confirmed personal preferences yet._"]));
-  if (project) lines.push("", `## Project: ${project}`, "", ...(prefs.local.length ? prefs.local.map(prefLine) : ["_No confirmed preferences for this project._"]));
+  lines.push(...scopeLines(prefs.global, "_No confirmed personal preferences yet._"));
+  if (project) lines.push("", `## Project: ${project}`, "", ...scopeLines(prefs.local, "_No confirmed preferences for this project._"));
   return lines.join("\n")+"\n";
 }
 function writeOrPrint(content: string, file?: string): void {
@@ -407,6 +421,7 @@ const COMMANDS: Record<string, (c: CommandContext) => unknown> = {
   observe: c => cmdObserve(c.db, c.a),
   feedback: c => cmdFeedback(c.db, c.a),
   prefer: c => cmdPrefer(c.db, c.a),
+  area: c => cmdArea(c.db, c.a),
   retire: c => cmdRetire(c.db, c.a),
   candidates: c => cmdCandidates(c.db, c.a),
   profile: c => cmdProfile(c.db, c.a),

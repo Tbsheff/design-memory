@@ -27,7 +27,7 @@ elif [[ -f "$legacy" ]]; then
 fi
 
 mkdir -p "$core/skill-definitions"
-for name in taste-add taste-use; do
+for name in taste-add taste-define taste-use; do
   if [[ -f "$src/skills/$name/SKILL.md" ]]; then
     cp "$src/skills/$name/SKILL.md" "$core/skill-definitions/$name.md"
   fi
