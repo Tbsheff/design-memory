@@ -1,9 +1,9 @@
 import { describe, expect, test } from "bun:test";
 import { parseJudgement, parseRunArgs } from "../bench/lib.ts";
-import type { Target } from "../bench/lib.ts";
+import type { BuildScore, Target } from "../bench/lib.ts";
 import {
-  buildObjective, compareEvals, evalScore, lintCandidate, meanSe, objective, parseProfileRules, parseRuleJudgement, prepareHtml,
-  rulePass, splitTargets, stopReason, worstBuilds,
+  armSummary, buildObjective, evalScore, lintCandidate, meanSe, objective, parseProfileRules, parseRuleJudgement, prepareHtml,
+  rulePass, splitTargets, worstBuilds,
 } from "../bench/objective.ts";
 import { parseOptimizeArgs } from "../bench/optimize.ts";
 
@@ -56,43 +56,13 @@ describe("objective math", () => {
   });
 });
 
-describe("acceptance rule", () => {
-  const ev = (pairs: [string, number][]) => pairs.map(([target, objective]) => ({ target, objective }));
-
-  test("accepts a clear paired gain", () => {
-    const c = compareEvals(ev([["a", 0.5], ["b", 0.4], ["c", 0.6]]), ev([["a", 0.6], ["b", 0.5], ["c", 0.68]]));
-    expect(c.accept).toBe(true);
-    expect(c.diff).toBeCloseTo(0.0933, 3);
-  });
-
-  test("rejects a gain below the 0.02 floor", () => {
-    expect(compareEvals(ev([["a", 0.5]]), ev([["a", 0.515]])).accept).toBe(false);
-    expect(compareEvals(ev([["a", 0.5]]), ev([["a", 0.53]])).accept).toBe(true);
-  });
-
-  test("rejects a gain inside one standard error", () => {
-    const c = compareEvals(ev([["a", 0.5], ["b", 0.5]]), ev([["a", 0.7], ["b", 0.42]]));
-    expect(c.diff).toBeCloseTo(0.06, 4);
-    expect(c.se).toBeCloseTo(0.14, 4);
-    expect(c.accept).toBe(false);
-  });
-
-  test("averages samples per target and ignores targets only one side has", () => {
-    const c = compareEvals(ev([["a", 0.4], ["a", 0.6], ["z", 0.9]]), ev([["a", 0.6], ["a", 0.6]]));
-    expect(c.targets).toBe(1);
-    expect(c.diff).toBeCloseTo(0.1, 4);
-  });
-
-  test("no shared targets never accepts", () => {
-    expect(compareEvals([], ev([["a", 1]])).accept).toBe(false);
-  });
-
-  test("stop reasons", () => {
-    const base = { round: 2, rounds: 5, spent: 10, nextRound: 6, reserve: 8, budget: 45, rejectStreak: 0 };
-    expect(stopReason(base)).toBeNull();
-    expect(stopReason({ ...base, round: 6 })).toContain("finished");
-    expect(stopReason({ ...base, rejectStreak: 2 })).toContain("2 rejections");
-    expect(stopReason({ ...base, spent: 32 })).toContain("budget");
+describe("arm summary", () => {
+  test("means the objective, overall and rule pass", () => {
+    const b = (overall: number, rule: number | null, objective: number) => ({ target: "a", mode: "taste", sample: 1, ok: true, objective, judge: { overall: { score: overall } }, rules: { rule_pass: rule } }) as unknown as BuildScore;
+    const a = armSummary([b(6, 0.8, 0.66), b(4, null, 0.4)]);
+    expect(a.score.mean).toBeCloseTo(0.53, 4);
+    expect(a.overall.mean).toBe(5);
+    expect(a.rule_pass.n).toBe(1);
   });
 });
 
@@ -171,8 +141,10 @@ describe("args", () => {
   });
 
   test("optimize defaults and overrides", () => {
-    expect(parseOptimizeArgs([])).toMatchObject({ rounds: 5, samples: 2, budgetUsd: 45, holdoutSamples: 2, trainTargets: null });
-    expect(parseOptimizeArgs(["--rounds", "1", "--samples", "1", "--train-targets", "a,b"])).toMatchObject({ rounds: 1, holdoutSamples: 1, trainTargets: ["a", "b"] });
+    expect(parseOptimizeArgs([])).toMatchObject({ rounds: 5, samples: 2, budgetUsd: 60, holdoutSamples: 3, candidates: 3, trainTargets: null, accept: { on: "closer", minWinRate: 0.6, maxP: 0.2, minGuardRate: 0.4 } });
+    expect(parseOptimizeArgs(["--rounds", "1", "--samples", "1", "--candidates", "2", "--train-targets", "a,b", "--accept-on", "rules", "--max-p", "0.1"])).toMatchObject({ rounds: 1, candidates: 2, trainTargets: ["a", "b"], accept: { on: "rules", maxP: 0.1 } });
     expect(() => parseOptimizeArgs(["--bogus", "1"])).toThrow("unknown flag");
+    expect(() => parseOptimizeArgs(["--candidates", "4"])).toThrow("at most 3");
+    expect(() => parseOptimizeArgs(["--accept-on", "vibes"])).toThrow("--accept-on");
   });
 });

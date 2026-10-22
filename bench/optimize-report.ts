@@ -1,14 +1,15 @@
 import { existsSync, writeFileSync } from "node:fs";
 import { join, relative } from "node:path";
-import type { MeanSe } from "./objective.ts";
+import type { ArmScore, MeanSe } from "./objective.ts";
+import { statLine } from "./pairwise.ts";
+import type { AcceptRule, PairSummary } from "./pairwise.ts";
+import type { CandidateRecord, RoundRecord } from "./resume.ts";
 
-type Arm = { score: MeanSe; overall: MeanSe; rule_pass: MeanSe };
 type Final = {
   stop_reason: string | null; best_round: number; holdout_targets: string[]; holdout_samples: number; total_cost_usd: number;
-  holdout: Record<"baseline" | "original" | "best", Arm>; holdout_runs: { original: string; best: string };
-  holdout_compare: Record<string, { diff: number; se: number; targets: number }>;
+  holdout: Record<"baseline" | "original" | "best", ArmScore>; holdout_runs: { original: string; best: string };
+  holdout_pairs: Record<string, PairSummary>; accept_rule: AcceptRule;
 };
-type Row = { round: number; train: MeanSe | null; accepted: boolean; reason: string; cost: { total: number }; proposer_summary: string };
 
 const esc = (s: unknown) => String(s ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]!);
 const f = (n: number | undefined, p = 3) => (n === undefined || !Number.isFinite(n) ? "–" : n.toFixed(p));
@@ -21,16 +22,31 @@ th{font-size:11px;text-transform:uppercase;letter-spacing:.5px;color:#6b7075}td.
 pre{background:#fff;border:1px solid #e3e4e2;border-radius:8px;padding:12px;overflow:auto;font:12px/1.45 ui-monospace,Menlo,monospace}.add{color:#1d6b2a;background:#eaf6ec;display:block}.del{color:#9b2c2c;background:#fbecec;display:block}.hunk{color:#6b7075;display:block}
 .grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin-bottom:20px}.grid img{width:100%;border-radius:6px;outline:1px solid rgba(0,0,0,.1);outline-offset:-1px}.grid p{margin:0 0 4px;font-weight:600}`;
 
-function roundsTable(rows: Row[]): string {
-  const body = rows.map(r => `<tr><td>${r.round}</td><td class="n">${pm(r.train)}</td><td class="${r.accepted ? "ok" : "no"}">${r.round === 0 ? "start" : r.accepted ? "yes" : "no"}</td><td class="n">$${f(r.cost.total, 2)}</td><td>${esc(r.reason)}</td><td><details><summary>summary</summary>${esc(r.proposer_summary)}</details></td></tr>`).join("");
-  return `<table><thead><tr><th>Round</th><th>Train score ± se</th><th>Accepted</th><th>Cost</th><th>Decision</th><th>Proposer</th></tr></thead><tbody>${body}</tbody></table>`;
+function pairCell(p: PairSummary | null): string {
+  if (!p) return "<td>–</td><td>–</td><td>–</td>";
+  return `<td>${esc(statLine(p.closer))}</td><td>${esc(statLine(p.rules))}</td><td class="n">${p.split.closer}/${p.pairs}</td>`;
+}
+
+function candidateRow(r: RoundRecord, c: CandidateRecord): string {
+  const promoted = r.promoted === c.focus;
+  const status = promoted ? "promoted" : c.accepted ? "passed" : "no";
+  return `<tr><td>${r.round}</td><td>${esc(c.focus)}</td>${pairCell(c.pairs)}<td class="${promoted ? "ok" : "no"}">${status}</td><td class="n">$${f(c.cost.total, 2)}</td><td>${esc(c.reason)}</td><td><details><summary>summary</summary>${esc(c.summary)}</details></td></tr>`;
+}
+
+function roundsTable(rows: RoundRecord[]): string {
+  const body = rows.map(r => {
+    const inc = `<tr><td>${r.round}</td><td>incumbent (round ${r.incumbent_from})</td><td colspan="3">fresh builds: score ${pm(r.incumbent_score.score)}, overall ${pm(r.incumbent_score.overall, 2)}, rule pass ${pm(r.incumbent_score.rule_pass)}</td><td></td><td class="n">round $${f(r.cost, 2)}</td><td></td><td></td></tr>`;
+    return inc + r.candidates.map(c => candidateRow(r, c)).join("");
+  }).join("");
+  return `<table><thead><tr><th>Round</th><th>Arm</th><th>Closer W-L-T</th><th>Rules W-L-T</th><th>Split orders</th><th>Status</th><th>Cost</th><th>Decision</th><th>Proposer</th></tr></thead><tbody>${body}</tbody></table>`;
 }
 
 function holdoutTable(final: Final): string {
   const arms = ["baseline", "original", "best"] as const;
   const body = arms.map(a => `<tr><td>${a}</td><td class="n">${pm(final.holdout[a].score)}</td><td class="n">${pm(final.holdout[a].overall, 2)}</td><td class="n">${pm(final.holdout[a].rule_pass)}</td><td class="n">${final.holdout[a].score.n}</td></tr>`).join("");
-  const cmp = Object.entries(final.holdout_compare).map(([k, c]) => `<li>${esc(k.replaceAll("_", " "))}: paired diff ${f(c.diff)} ± ${f(c.se)} over ${c.targets} targets</li>`).join("");
-  return `<table><thead><tr><th>Arm</th><th>Score ± se</th><th>Overall /10</th><th>Rule pass</th><th>Builds</th></tr></thead><tbody>${body}</tbody></table><ul>${cmp}</ul>`;
+  const pairs = Object.entries(final.holdout_pairs).map(([k, p]) => `<tr><td>${esc(k.replaceAll("_", " "))}</td>${pairCell(p)}</tr>`).join("");
+  return `<table><thead><tr><th>Arm</th><th>Score ± se</th><th>Overall /10</th><th>Rule pass</th><th>Builds</th></tr></thead><tbody>${body}</tbody></table>
+<h3>Pairwise (W-L-T is wins-losses-ties for the first arm named)</h3><table><thead><tr><th>Comparison</th><th>Closer</th><th>Rules</th><th>Split orders</th></tr></thead><tbody>${pairs}</tbody></table>`;
 }
 
 function diffHtml(diff: string): string {
@@ -57,12 +73,12 @@ function holdoutImages(opt: string, final: Final): string {
   return rows.join("");
 }
 
-export async function writeOptimizeReport(opt: string, final: Final, rows: Row[], diff: string): Promise<void> {
+export async function writeOptimizeReport(opt: string, final: Final, rows: RoundRecord[], diff: string): Promise<void> {
   const html = `<!doctype html><html lang="en"><head><meta charset="utf-8"><title>taste-use skill optimization</title><style>${STYLE}</style></head><body><main>
 <h1>taste-use skill optimization</h1><p class="sub">${esc(opt)} · stop: ${esc(final.stop_reason)} · best round ${final.best_round} · total $${f(final.total_cost_usd, 2)}</p>
-<p class="sub">Score per build = 0.7 × judge overall / 10 + 0.3 × rule pass rate. Train numbers have selection bias; holdout is the honest check.</p>
+<p class="sub">Each round builds the incumbent fresh, then each candidate. A blind judge compares each candidate build with the incumbent build for the same case, in both left/right orders. One pair = one outcome: both orders agree, or one wins and one ties; split orders count as a tie. Accept on ${esc(final.accept_rule.on)}: win rate ≥ ${final.accept_rule.minWinRate} over non-ties and sign test p &lt; ${final.accept_rule.maxP}; the other question needs win rate ≥ ${final.accept_rule.minGuardRate}. Score per build = 0.7 × judge overall / 10 + 0.3 × rule pass rate.</p>
 <h2>Holdout (${final.holdout_targets.length} targets × ${final.holdout_samples} samples)</h2>${holdoutTable(final)}
-<h2>Rounds (train)</h2>${roundsTable(rows)}
+<h2>Rounds (train, candidate vs incumbent)</h2>${roundsTable(rows)}
 <h2>Skill diff: original → best</h2>${diffHtml(diff)}
 <h2>Holdout builds</h2>${holdoutImages(opt, final)}
 </main></body></html>`;

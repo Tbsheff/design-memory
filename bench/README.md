@@ -112,23 +112,32 @@ The images belong to their authors. They are kept here only for private benchmar
 ## Optimizer
 
 ```bash
-bun bench/optimize.ts --rounds 5 --samples 2 --budget-usd 45 \
-  [--holdout-samples N] [--train-targets id,id] [--holdout-targets id,id] [--model sonnet] [--judge-model opus] \
-  [--proposer-model opus] [--concurrency 5] [--build-budget-usd 5] [--out bench/optimize/<timestamp>]
+bun bench/optimize.ts --rounds 5 --samples 2 --candidates 3 --budget-usd 60 \
+  [--holdout-samples 3] [--train-targets id,id] [--holdout-targets id,id] [--model sonnet] [--judge-model opus] \
+  [--proposer-model opus] [--concurrency 6] [--build-budget-usd 5] [--out bench/optimize/<timestamp>] \
+  [--accept-on closer|rules] [--min-win-rate 0.6] [--max-p 0.2] [--min-guard-rate 0.4]
+bun bench/optimize.ts --resume bench/optimize/<dir>
 ```
 
 It improves copies of the taste-use skill (`skills/taste-use/SKILL.md` and the four references). It never edits the repo files.
 
-1. Round 0 copies the repo skill to `<out>/original/` and evaluates it on train (taste mode). That result is the cached incumbent.
-2. Each round, a proposer (`claude -p`, opus) runs in a fresh temp folder that holds only `skill/` (editable) and `feedback/`: train judge reasons and rule misses per build, labeled `case-N`, the most-missed rules, side-by-side PNGs (target | build) of the 3 worst builds, and earlier proposals with their verdicts and rejected diffs. Read is allowed only in that folder, and Edit and Write only in `skill/`. Probe: it could not read `bench/targets/` or `bench/runs/`, nor write outside the folder. It never sees holdout images, reasons or names.
-3. Before it spends money, a lint rejects a candidate with no edits, a changed `name: taste-use` frontmatter, more than 95 lines in SKILL.md, a hex color, a broken reference link, or a target id, author or product name.
-4. The candidate is evaluated on train. Acceptance compares per-target means paired with the incumbent: accept when the mean paired gain is at least 0.02 and greater than its standard error. Paired differences remove the spread between targets, which is larger than the effect we look for.
-5. The loop stops after `--rounds`, after 2 rejections in a row, or when spent + the largest round so far + a holdout reserve passes `--budget-usd`.
-6. Holdout: baseline, the original skill and the best skill, `--holdout-samples` each. `<out>/final.json` and `<out>/report.html` show the holdout table, the round table and the skill diff (original → best).
+The first loop (`full-1`) compared absolute 0–10 scores. Their standard error (about 0.015–0.024 with 2 samples) was as large as the gains, the incumbent's cached score was biased by selection, and one proposal per round with a stop after 2 rejections ended it after 2 rounds. The loop now compares builds head to head.
 
-Output: `<out>/history.json` (round, diff, lint, train score ± se, comparison, accepted, cost), `<out>/round-k/{candidate,feedback,proposer-transcript.json}`, `<out>/evals/<name>/` (normal run folders). `bench/optimize/` is git-ignored.
+Each round k:
 
-Caveat: the incumbent's cached score is the one that won selection, so it is biased upward. Later candidates must beat a lucky number, and early stops are more likely. Only holdout is a fair estimate.
+1. Build the incumbent skill fresh on train (taste mode) and score it (judge and rule judge). Round 1 builds the original. These builds are the proposers' feedback and the comparison side for this round, so the incumbent never keeps a score that won a selection.
+2. `--candidates` proposers (opus) run in parallel from the incumbent, each with one focus: `craft` (what makes a short prompt give a dense, credible product screen), `process` (step order, what to plan before code, how to check without a browser), `rules` (turn each profile rule into CSS decisions and check them everywhere). Each runs in a fresh temp folder that holds only `skill/` (editable) and `feedback/`: train judge reasons and rule misses per build (labeled `case-N`), the most-missed rules, side-by-side PNGs of the 3 worst builds, and every earlier candidate with its focus, verdict, diff (when not promoted) and pairwise loss reasons. Read is allowed only in that folder, and Edit and Write only in `skill/`. It never sees holdout images, reasons or names.
+3. The lint from before rejects a candidate with no edits, a changed `name: taste-use` frontmatter, more than 95 lines in SKILL.md, a hex color, a broken reference link, or a target id, author or product name.
+4. Each candidate builds train (same targets and samples). Candidates are not scored on the absolute scale, to save money.
+5. Pairwise judge (opus, `pairwise.ts`, `pair-judge.ts`): for each target × sample, a blind call gets `1-target.jpg`, `2-left.png`, `3-right.png` and the profile rules, and answers which build is closer to the target and which follows the rules better (or tie), each with a one-line reason. It runs twice per pair, incumbent left and then candidate left. The two orders make one outcome: a win in both, or a win and a tie, is a win; a win for each side (split, from position bias) is a tie. A build that failed loses without a call. Each call is cached in `round-k/cand-<focus>/pairs/<target>-<sample>-<order>.json`, with `left` naming the arm (`a` = incumbent, `b` = candidate).
+6. Accept a candidate when, on `--accept-on` (default `closer`), its win rate over non-tie pairs is at least `--min-win-rate` and the one-sided sign test p is below `--max-p`, and its win rate on the other question is at least `--min-guard-rate` (or it has no non-ties there). With 10 pairs, 7 wins and 3 losses gives p 0.172; 6–4 gives p 0.377. The best passing candidate (win rate, then p) becomes the incumbent. There is no stop on rejections.
+7. Before each round, the loop runs as many candidates (up to `--candidates`) as fit: spent + the round estimate + a holdout reserve must stay within `--budget-usd`. When not even one candidate fits, it stops. The estimates use the measured cost per build, per scored build, per pair call and per proposer. The focus order rotates by round, so a round with fewer candidates does not always drop the same focus.
+
+Holdout: baseline and the original skill (one eval) and the best skill, `--holdout-samples` each, all scored on the absolute scale. Pairwise best vs baseline and best vs original (when the best is not the original) on the same samples, both orders. `<out>/final.json` and `<out>/report.html` show the holdout table, the pairwise win rates with counts, every round's candidates and the skill diff (original → best).
+
+Output: `<out>/history.json` (one record per round: incumbent, its fresh scores, each candidate with focus, diff, lint, pairwise summary, decision, loss reasons and cost, the promoted focus, spent and cost totals), `<out>/round-k/cand-<focus>/{candidate,feedback,proposer-transcript.json,pairs}`, `<out>/evals/<name>/` (normal run folders), `<out>/holdout-pairs/`. `bench/optimize/` is git-ignored.
+
+`--resume <dir>` reads `options.json` and `history.json`, restores the incumbent, spent cost and earlier candidates, and redoes the unfinished round: finished builds, scores, proposals and pair calls are reused.
 
 ## Caveats
 

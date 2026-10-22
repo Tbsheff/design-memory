@@ -1,15 +1,21 @@
 import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
-import { DIMENSIONS, readFlags, round, selectTargets, timestamp } from "./lib.ts";
+import { readFlags, round, selectTargets, timestamp } from "./lib.ts";
 import type { BuildScore, Mode, Target } from "./lib.ts";
-import { compareEvals, evalScore, lintCandidate, splitTargets, stopReason, worstBuilds } from "./objective.ts";
-import type { Comparison, MeanSe } from "./objective.ts";
+import { armSummary, lintCandidate, splitTargets } from "./objective.ts";
+import type { ArmScore } from "./objective.ts";
+import { FOCUSES, proposerPrompt, writeFeedback } from "./optimize-feedback.ts";
+import type { Attempt, CaseLabel, Focus } from "./optimize-feedback.ts";
 import { writeOptimizeReport } from "./optimize-report.ts";
+import { judgePairs } from "./pair-judge.ts";
+import type { ArmRef, PairResult } from "./pair-judge.ts";
+import { addTotals, decide, EMPTY_TOTALS, focusOrder, holdoutEstimate, pickBest, planRound, QUESTIONS, unitCosts } from "./pairwise.ts";
+import type { AcceptRule, CostTotals, Decision, PairOutcome, PairSummary, Question } from "./pairwise.ts";
 import { BENCH, loadTargets, runBench } from "./run.ts";
-import { holdoutReserve, PROPOSER_SLACK_USD, readJson, restoreLoop, savedProposal } from "./resume.ts";
-import type { Attempt, HistoryEntry } from "./resume.ts";
-import { buildDirs, currentScore, scoreRun } from "./score.ts";
+import { readJson, restoreRounds, savedProposal } from "./resume.ts";
+import type { CandidateRecord, RoundRecord } from "./resume.ts";
+import { loadRules, scoreRun } from "./score.ts";
 import { parseClaudeOutput, run, runClaude, SKILL_FILES } from "./tools.ts";
 
 const REPO = dirname(BENCH);
@@ -17,9 +23,10 @@ const MAX_SKILL_LINES = 95;
 const EXTRA_BANNED = ["Stripe", "Escalation Watch", "Payvora"];
 
 export type OptimizeOptions = {
-  rounds: number; samples: number; budgetUsd: number; holdoutSamples: number;
+  rounds: number; samples: number; budgetUsd: number; holdoutSamples: number; candidates: number;
   trainTargets: string[] | null; holdoutTargets: string[] | null;
   model: string; judgeModel: string; proposerModel: string; concurrency: number; buildBudgetUsd: number; out: string | null;
+  accept: AcceptRule;
 };
 
 function num(flags: Map<string, string>, key: string, fallback: number): number {
@@ -30,42 +37,59 @@ function num(flags: Map<string, string>, key: string, fallback: number): number 
   return n;
 }
 
-const FLAGS = new Set(["rounds", "samples", "budget-usd", "holdout-samples", "train-targets", "holdout-targets", "model", "judge-model", "proposer-model", "concurrency", "build-budget-usd", "out"]);
+const FLAGS = new Set([
+  "rounds", "samples", "budget-usd", "holdout-samples", "candidates", "train-targets", "holdout-targets", "model", "judge-model", "proposer-model",
+  "concurrency", "build-budget-usd", "out", "accept-on", "min-win-rate", "max-p", "min-guard-rate",
+]);
+
+function acceptRule(flags: Map<string, string>): AcceptRule {
+  const on = flags.get("accept-on") ?? "closer";
+  if (!(QUESTIONS as readonly string[]).includes(on)) throw new Error(`--accept-on must be ${QUESTIONS.join(" or ")}`);
+  return { on: on as Question, minWinRate: num(flags, "min-win-rate", 0.6), maxP: num(flags, "max-p", 0.2), minGuardRate: num(flags, "min-guard-rate", 0.4) };
+}
 
 export function parseOptimizeArgs(argv: string[]): OptimizeOptions {
   const flags = readFlags(argv);
   const unknown = [...flags.keys()].filter(k => !FLAGS.has(k));
   if (unknown.length) throw new Error(`unknown flag: --${unknown.join(", --")}`);
   const ids = (key: string) => flags.get(key)?.split(",").map(s => s.trim()).filter(Boolean) ?? null;
-  const samples = Math.round(num(flags, "samples", 2));
+  const candidates = Math.round(num(flags, "candidates", 3));
+  if (candidates > FOCUSES.length) throw new Error(`--candidates is at most ${FOCUSES.length}`);
   return {
-    rounds: Math.round(num(flags, "rounds", 5)), samples, budgetUsd: num(flags, "budget-usd", 45),
-    holdoutSamples: Math.round(num(flags, "holdout-samples", samples)),
+    rounds: Math.round(num(flags, "rounds", 5)), samples: Math.round(num(flags, "samples", 2)), budgetUsd: num(flags, "budget-usd", 60),
+    holdoutSamples: Math.round(num(flags, "holdout-samples", 3)), candidates,
     trainTargets: ids("train-targets"), holdoutTargets: ids("holdout-targets"),
     model: flags.get("model") ?? "sonnet", judgeModel: flags.get("judge-model") ?? "opus", proposerModel: flags.get("proposer-model") ?? "opus",
-    concurrency: Math.round(num(flags, "concurrency", 5)), buildBudgetUsd: num(flags, "build-budget-usd", 5), out: flags.get("out") ?? null,
+    concurrency: Math.round(num(flags, "concurrency", 6)), buildBudgetUsd: num(flags, "build-budget-usd", 5), out: flags.get("out") ?? null,
+    accept: acceptRule(flags),
   };
 }
 
-type Eval = { name: string; out: string; scores: BuildScore[]; byMode: Record<string, BuildScore[]>; cost: number; builds: number };
-
-type Ctx = { opt: string; options: OptimizeOptions; train: Target[]; holdout: Target[]; spent: number; resume: boolean };
-
-async function evaluate(ctx: Ctx, name: string, skillDir: string, targets: Target[], modes: Mode[], samples: number): Promise<Eval> {
-  const out = join(ctx.opt, "evals", name);
-  const o = ctx.options;
-  const runInfo = await runBench({ targets: targets.map(t => t.id), modes, samples, model: o.model, concurrency: o.concurrency, out, timeoutMinutes: 20, budgetUsd: o.buildBudgetUsd, skillDir }, targets, true, ctx.resume);
-  const scored = await scoreRun({ run: out, judgeModel: o.judgeModel, concurrency: o.concurrency, force: false }, true);
-  const byMode: Record<string, BuildScore[]> = {};
-  for (const s of scored.scores) byMode[s.mode] = [...(byMode[s.mode] ?? []), s];
-  const cost = round(runInfo.cost_usd + scored.judge_cost_usd);
-  ctx.spent = round(ctx.spent + cost);
-  log(`eval ${name}: ${runInfo.builds} builds, ${runInfo.failed} failed, $${cost.toFixed(2)} (total $${ctx.spent.toFixed(2)})`);
-  return { name, out, scores: scored.scores, byMode, cost, builds: runInfo.builds };
-}
+type Eval = { name: string; out: string; scores: BuildScore[]; byMode: Record<string, BuildScore[]>; cost: number };
+type Ctx = { opt: string; options: OptimizeOptions; train: Target[]; holdout: Target[]; spent: number; totals: CostTotals; resume: boolean };
+type EvalSpec = { name: string; skillDir: string; targets: Target[]; modes: Mode[]; samples: number; score: boolean; concurrency?: number };
 
 function log(line: string) {
   console.log(`[${new Date().toISOString().slice(11, 19)}] ${line}`);
+}
+
+function charge(ctx: Ctx, usd: number, totals: Partial<CostTotals>) {
+  ctx.spent = round(ctx.spent + usd);
+  ctx.totals = addTotals(ctx.totals, totals);
+}
+
+async function evaluate(ctx: Ctx, spec: EvalSpec): Promise<Eval> {
+  const out = join(ctx.opt, "evals", spec.name);
+  const o = ctx.options;
+  const concurrency = spec.concurrency ?? o.concurrency;
+  const runInfo = await runBench({ targets: spec.targets.map(t => t.id), modes: spec.modes, samples: spec.samples, model: o.model, concurrency, out, timeoutMinutes: 20, budgetUsd: o.buildBudgetUsd, skillDir: spec.skillDir }, spec.targets, true, ctx.resume);
+  const scored = spec.score ? await scoreRun({ run: out, judgeModel: o.judgeModel, concurrency, force: false }, true) : { scores: [], judge_cost_usd: 0 };
+  const byMode: Record<string, BuildScore[]> = {};
+  for (const s of scored.scores) byMode[s.mode] = [...(byMode[s.mode] ?? []), s];
+  const cost = round(runInfo.cost_usd + scored.judge_cost_usd);
+  charge(ctx, cost, { build_usd: runInfo.cost_usd, builds: runInfo.builds, score_usd: scored.judge_cost_usd, scored: scored.scores.filter(s => s.judge).length });
+  log(`eval ${spec.name}: ${runInfo.builds} builds, ${runInfo.failed} failed, $${cost.toFixed(2)} (total $${ctx.spent.toFixed(2)})`);
+  return { name: spec.name, out, scores: scored.scores, byMode, cost };
 }
 
 function readSkill(dir: string): Record<string, string> {
@@ -92,179 +116,161 @@ export async function skillDiff(a: string, b: string): Promise<string> {
   return new TextDecoder().decode(out.stdout).replaceAll(`${a.slice(1)}/`, "before/").replaceAll(`${b.slice(1)}/`, "after/");
 }
 
-type CaseLabel = Map<string, string>;
+type Proposal = { focus: Focus; dir: string; summary: string; cost: number; error?: string };
+type RoundInput = { k: number; incDir: string; inc: Eval; labels: CaseLabel; attempts: Attempt[] };
 
-function metaOf(evalOut: string, s: BuildScore): Record<string, unknown> {
-  const path = join(evalOut, s.target, s.mode, String(s.sample), "meta.json");
-  return existsSync(path) ? JSON.parse(readFileSync(path, "utf8")) : {};
+function savedCandidate(candDir: string): Omit<Proposal, "focus" | "dir"> | null {
+  const dir = join(candDir, "candidate");
+  const path = join(candDir, "proposer-transcript.json");
+  const raw = existsSync(path) ? readFileSync(path, "utf8") : null;
+  return savedProposal(SKILL_FILES.map(f => existsSync(join(dir, f))), raw === null ? null : parseClaudeOutput(raw));
 }
 
-function buildBlock(e: Eval, s: BuildScore, labels: CaseLabel): string {
-  const m = metaOf(e.out, s);
-  const head = `#### ${labels.get(s.target)} sample ${s.sample}: score ${s.objective ?? "–"}, overall ${s.judge?.overall.score ?? "–"}/10, rule pass ${s.rules?.rule_pass ?? "–"}`;
-  const usage = `- Skill loaded: ${m.skill_used ? "yes" : "no"}; taste CLI calls that returned data: ${m.taste_ok_calls ?? 0}/${m.taste_calls ?? 0}; library images opened: ${m.image_reads_ok ?? 0}; turns: ${m.num_turns ?? "–"}`;
-  if (!s.ok) return [head, usage, `- Build failed: ${s.error ?? m.error ?? "unknown"}`].join("\n");
-  const dims = DIMENSIONS.map(d => `- ${d} ${s.judge![d].score}: ${s.judge![d].reason}`);
-  const misses = (s.rules?.results ?? []).filter(r => r.verdict === "misses").map(r => `- MISS ${r.rule.slice(0, 90)}: ${r.reason}`);
-  return [head, usage, "Judge (target vs build):", ...dims, "Rule misses:", ...(misses.length ? misses : ["- none"])].join("\n");
-}
-
-function missedRules(scores: BuildScore[]): string[] {
-  const counts = new Map<string, number>();
-  for (const s of scores) for (const r of s.rules?.results ?? []) if (r.verdict === "misses") counts.set(r.rule, (counts.get(r.rule) ?? 0) + 1);
-  return [...counts].sort((a, b) => b[1] - a[1]).map(([rule, n]) => `- ${n}/${scores.length} builds miss: ${rule}`);
-}
-
-function attemptsBlock(attempts: Attempt[]): string {
-  if (!attempts.length) return "None yet. This is the first proposal.";
-  return attempts.map(a => [`### Round ${a.round}: ${a.accepted ? "ACCEPTED" : "REJECTED"} (${a.reason})`, `Proposer summary: ${a.summary.slice(0, 1200)}`, a.accepted ? "" : `Rejected diff (do not repeat it as is):\n\`\`\`diff\n${a.diff.slice(0, 5000)}\n\`\`\``].join("\n")).join("\n\n");
-}
-
-async function sideBySide(e: Eval, s: BuildScore, path: string) {
-  const target = join(e.out, "targets", `${s.target}.jpg`);
-  const build = join(e.out, s.target, s.mode, String(s.sample), "build.png");
-  if (!existsSync(build)) return false;
-  const out = await run(["magick", target, build, "-resize", "x900", "-background", "white", "-splice", "16x0", "+append", "-chop", "16x0", "+repage", path]);
-  return out.code === 0;
-}
-
-async function writeFeedback(dir: string, e: Eval, score: MeanSe, labels: CaseLabel, attempts: Attempt[]): Promise<void> {
-  mkdirSync(dir, { recursive: true });
-  const scores = e.byMode.taste ?? [];
-  const pairs: string[] = [];
-  for (const [i, s] of worstBuilds(scores, 3).entries()) {
-    const name = `pair-${i + 1}.png`;
-    if (await sideBySide(e, s, join(dir, name))) pairs.push(`- ${name}: ${labels.get(s.target)} sample ${s.sample} (score ${s.objective}). Left = target, right = build.`);
-  }
-  const cases = [...labels].map(([id, label]) => {
-    const prompt = loadTargets().find(t => t.id === id)?.prompt ?? "";
-    const builds = scores.filter(s => s.target === id).sort((a, b) => a.sample - b.sample).map(s => buildBlock(e, s, labels));
-    return [`### ${label}`, `Prompt: ${prompt}`, ...builds].join("\n\n");
-  });
-  const text = [
-    "# Train results for the current skill",
-    `Score per build = 0.7 x (judge overall / 10) + 0.3 x (rule pass rate). Current mean: ${score.mean} +/- ${score.se} (standard error, ${score.n} builds).`,
-    "## Rules most often missed", ...missedRules(scores),
-    "## Worst builds, side by side", ...(pairs.length ? pairs : ["- no images"]),
-    "## Every case", ...cases,
-    "## Earlier proposals", attemptsBlock(attempts),
-  ].join("\n\n");
-  writeFileSync(join(dir, "feedback.md"), text);
-}
-
-const PROPOSER_PROMPT = `You improve a skill for a coding agent. The skill is "taste-use". It tells an agent how to build or review a user interface with the user's saved design taste: a profile of confirmed rules, plus a library of saved reference designs (screenshots) that the user collected.
-
-The skill files are in ./skill/ (SKILL.md and references/*.md). Edit them in place. Do not create other files.
-
-How we test the skill:
-- A builder agent gets a short product prompt (for example "build a dark usage dashboard with a KPI row and a table") plus "Use my saved design taste (taste-use skill) for this."
-- The builder runs headless. It has Read, Write, Edit, the Skill tool, and Bash limited to the taste CLI read commands (profile, brief, show, list, search). It writes one index.html. It cannot run a browser, so it cannot see its own page.
-- "taste brief" and "taste show" print the saved references, and for screenshots they print a local image path. The builder may Read those image files.
-- The page is rendered and compared with a target design. The targets come from designers the user follows, so they stand in for the user's taste. The builder never sees the target. A judge scores how close the build looks to the target, and a second judge checks the build against each profile rule.
-
-Do this:
-1. Read ./feedback/feedback.md. Then look at the side-by-side images in ./feedback/ (left = target, right = build).
-2. Find the 1 to 3 changes to the skill that are most likely to make builds look closer to the targets and follow the profile rules better. Look for causes in the process: what the builder loads, what it looks at, how it plans, and how it checks its work before it finishes.
-3. Edit the skill files.
-4. Reply with a short list of your changes and the reason for each.
-
-Constraints:
-- Guidance must be general. It must help any user with any taste library and any project. Never name a product, brand, company, person, number, color value, or specific layout that you saw in the feedback or the images.
-- Do not copy the profile rules into the skill. The builder loads them from the CLI.
-- Keep SKILL.md under about 90 lines, and keep its frontmatter. Keep each reference file focused on its one job.
-- Keep the plain Simplified Technical English style that the files use now: short sentences, active voice, common words.
-- Prefer process changes (what to load, what to look at, how to check) over long lists of rules.
-- The skill must still work in a normal project where the agent can run a browser. Do not remove guidance that is only wrong for this test setup; make it conditional instead.
-- Read "Earlier proposals" in the feedback. Do not repeat a rejected change.`;
-
-type Proposal = { dir: string; summary: string; cost: number; error?: string };
-
-async function propose(ctx: Ctx, k: number, incumbentDir: string, e: Eval, score: MeanSe, labels: CaseLabel, attempts: Attempt[]): Promise<Proposal> {
-  const roundDir = join(ctx.opt, `round-${k}`);
+async function freshProposal(ctx: Ctx, focus: Focus, candDir: string, input: RoundInput): Promise<Omit<Proposal, "focus" | "dir">> {
   const ws = realpathSync(mkdtempSync(join(tmpdir(), "bench-proposer-")));
   try {
-    copySkill(incumbentDir, join(ws, "skill"));
-    await writeFeedback(join(ws, "feedback"), e, score, labels, attempts);
-    cpSync(join(ws, "feedback"), join(roundDir, "feedback"), { recursive: true });
+    copySkill(input.incDir, join(ws, "skill"));
+    await writeFeedback(join(ws, "feedback"), { out: input.inc.out, scores: input.inc.byMode.taste ?? [] }, input.labels, input.attempts);
+    cpSync(join(ws, "feedback"), join(candDir, "feedback"), { recursive: true });
     const result = await runClaude({
-      prompt: PROPOSER_PROMPT, cwd: ws, model: ctx.options.proposerModel, tools: ["Read", "Edit", "Write"],
+      prompt: proposerPrompt(focus), cwd: ws, model: ctx.options.proposerModel, tools: ["Read", "Edit", "Write"],
       allowed: [`Read(/${ws}/**)`, `Edit(/${ws}/skill/**)`, `Write(/${ws}/skill/**)`], timeoutMs: 20 * 60_000, budgetUsd: 4,
     });
-    writeFileSync(join(roundDir, "proposer-transcript.json"), result.raw);
-    const dir = join(roundDir, "candidate");
-    copySkill(join(ws, "skill"), dir);
-    const cost = round(result.cost_usd ?? 0);
-    ctx.spent = round(ctx.spent + cost);
-    return { dir, summary: result.text.trim(), cost, error: result.ok ? undefined : result.error };
+    writeFileSync(join(candDir, "proposer-transcript.json"), result.raw);
+    copySkill(join(ws, "skill"), join(candDir, "candidate"));
+    return { summary: result.text.trim(), cost: round(result.cost_usd ?? 0), error: result.ok ? undefined : result.error };
   } finally {
     rmSync(ws, { recursive: true, force: true });
   }
+}
+
+async function propose(ctx: Ctx, focus: Focus, input: RoundInput): Promise<Proposal> {
+  const candDir = join(ctx.opt, `round-${input.k}`, `cand-${focus.id}`);
+  mkdirSync(candDir, { recursive: true });
+  const saved = savedCandidate(candDir);
+  if (saved) log(`round ${input.k} ${focus.id}: reusing saved proposal`);
+  const p = saved ?? await freshProposal(ctx, focus, candDir, input);
+  charge(ctx, p.cost, { proposer_usd: p.cost, proposers: 1 });
+  return { focus, dir: join(candDir, "candidate"), ...p };
 }
 
 function bannedWords(targets: Target[]): string[] {
   return [...targets.flatMap(t => [t.id, t.author, `@${t.author}`]), ...EXTRA_BANNED];
 }
 
-function sameSkill(a: string, b: string): boolean {
-  const x = readSkill(a);
-  const y = readSkill(b);
-  return SKILL_FILES.every(f => x[f] === y[f]);
-}
-
-function precheck(dir: string, incumbentDir: string, banned: string[]): string[] {
-  if (sameSkill(dir, incumbentDir)) return ["the proposer made no edits"];
-  const files = readSkill(dir);
+function precheck(p: Proposal, incumbentDir: string, banned: string[]): string[] {
+  if (p.error) return [`proposer failed: ${p.error}`];
+  const files = readSkill(p.dir);
+  const inc = readSkill(incumbentDir);
+  if (SKILL_FILES.every(f => files[f] === inc[f])) return ["the proposer made no edits"];
   const { "SKILL.md": skill, ...refs } = files;
   return lintCandidate({ skill: skill!, files: refs, banned, maxSkillLines: MAX_SKILL_LINES });
 }
 
-function writeHistory(opt: string, history: HistoryEntry[]) {
+export function lossReasons(list: PairOutcome[], loser: "a" | "b" = "b"): string[] {
+  const winner = loser === "a" ? "b" : "a";
+  return list.flatMap(o => QUESTIONS.flatMap(q => o.reasons[q].filter(r => r.winner === winner).map(r => `${q}: ${r.reason}`)));
+}
+
+type Trial = { rec: CandidateRecord; decision: Decision; summary: PairSummary | null };
+type Judged = Trial & { summary: PairSummary };
+
+function rejected(p: Proposal, diff: string, lint: string[]): Trial {
+  const reason = `rejected before eval: ${lint.join("; ")}`;
+  return { rec: { focus: p.focus.id, dir: p.dir, diff, lint, summary: p.summary, eval_dir: null, pairs: null, accepted: false, reason, losses: [], cost: { proposer: p.cost, builds: 0, pairs: 0, total: p.cost } }, decision: { accept: false, reason }, summary: null };
+}
+
+async function pairUp(ctx: Ctx, dir: string, a: ArmRef, b: ArmRef, targets: Target[], samples: number, rules: string[], concurrency: number): Promise<PairResult> {
+  const pr = await judgePairs({ dir, a, b, targets, samples, rules, model: ctx.options.judgeModel, concurrency });
+  charge(ctx, pr.cost, { pair_usd: pr.cost, pairs: pr.calls });
+  return pr;
+}
+
+async function trial(ctx: Ctx, p: Proposal, input: RoundInput, rules: string[], concurrency: number): Promise<Trial> {
+  const diff = await skillDiff(input.incDir, p.dir);
+  const lint = precheck(p, input.incDir, bannedWords([...ctx.train, ...ctx.holdout]));
+  if (lint.length) return rejected(p, diff, lint);
+  const o = ctx.options;
+  const e = await evaluate(ctx, { name: `round-${input.k}-cand-${p.focus.id}`, skillDir: p.dir, targets: ctx.train, modes: ["taste"], samples: o.samples, score: false, concurrency });
+  const pr = await pairUp(ctx, join(ctx.opt, `round-${input.k}`, `cand-${p.focus.id}`, "pairs"), { out: input.inc.out, mode: "taste" }, { out: e.out, mode: "taste" }, ctx.train, o.samples, rules, concurrency);
+  const decision = decide(pr.summary, o.accept);
+  const cost = { proposer: p.cost, builds: e.cost, pairs: pr.cost, total: round(p.cost + e.cost + pr.cost) };
+  const rec: CandidateRecord = { focus: p.focus.id, dir: p.dir, diff, lint, summary: p.summary, eval_dir: e.out, pairs: pr.summary, accepted: decision.accept, reason: decision.reason, losses: lossReasons(pr.outcomes), cost };
+  log(`round ${input.k} ${p.focus.id}: ${decision.accept ? "passes" : "fails"}. ${decision.reason}`);
+  return { rec, decision, summary: pr.summary };
+}
+
+type LoopState = { incDir: string; incFrom: number; history: RoundRecord[]; attempts: Attempt[]; nextRound: number };
+
+function writeHistory(opt: string, history: RoundRecord[]) {
   writeFileSync(join(opt, "history.json"), JSON.stringify(history, null, 2));
 }
 
-type Incumbent = { dir: string; round: number; eval: Eval; score: MeanSe };
-
-type LoopState = { inc: Incumbent; history: HistoryEntry[]; attempts: Attempt[]; streak: number; lastRoundCost: number };
-
-function verdict(cmp: Comparison): string {
-  const sign = cmp.diff >= 0 ? "+" : "";
-  return `${cmp.accept ? "beats" : "does not beat"} incumbent: paired diff ${sign}${cmp.diff} vs threshold ${cmp.threshold} (se ${cmp.se}, ${cmp.targets} targets)`;
-}
-
-async function oneRound(ctx: Ctx, k: number, st: LoopState, labels: CaseLabel, saved: Proposal | null = null): Promise<void> {
-  log(saved ? `round ${k}: reusing saved proposal` : `round ${k}: proposing from round ${st.inc.round}`);
-  const p = saved ?? await propose(ctx, k, st.inc.dir, st.inc.eval, st.inc.score, labels, st.attempts);
-  const diff = await skillDiff(st.inc.dir, p.dir);
-  const problems = p.error ? [`proposer failed: ${p.error}`] : precheck(p.dir, st.inc.dir, bannedWords([...ctx.train, ...ctx.holdout]));
-  let e: Eval | null = null;
-  let cmp: Comparison | null = null;
-  if (!problems.length) {
-    e = await evaluate(ctx, `round-${k}-train`, p.dir, ctx.train, ["taste"], ctx.options.samples);
-    cmp = compareEvals(st.inc.eval.byMode.taste ?? [], e.byMode.taste ?? []);
-  }
-  const accepted = !!cmp?.accept;
-  const reason = cmp ? verdict(cmp) : `rejected before eval: ${problems.join("; ")}`;
-  const score = e ? evalScore(e.byMode.taste ?? []) : null;
-  const evalCost = e?.cost ?? 0;
-  st.history.push({ round: k, candidate_dir: p.dir, parent_dir: st.inc.dir, diff, lint: problems, proposer_summary: p.summary, train: score, incumbent: st.inc.score, comparison: cmp, accepted, reason, cost: { proposer: p.cost, eval: evalCost, total: round(p.cost + evalCost) }, spent_after: ctx.spent });
-  st.attempts.push({ round: k, accepted, reason, summary: p.summary, diff });
-  st.lastRoundCost = Math.max(st.lastRoundCost, p.cost + evalCost);
-  st.streak = accepted ? 0 : st.streak + 1;
-  if (accepted && e && score) st.inc = { dir: p.dir, round: k, eval: e, score };
-  log(`round ${k}: ${accepted ? "ACCEPTED" : "rejected"}. ${reason}`);
+async function oneRound(ctx: Ctx, k: number, st: LoopState, labels: CaseLabel, count: number): Promise<void> {
+  const before = ctx.spent;
+  const o = ctx.options;
+  log(`round ${k}: ${count} candidates; fresh incumbent builds (skill from round ${st.incFrom})`);
+  const inc = await evaluate(ctx, { name: `round-${k}-incumbent`, skillDir: st.incDir, targets: ctx.train, modes: ["taste"], samples: o.samples, score: true });
+  const rules = await loadRules(inc.out);
+  const input: RoundInput = { k, incDir: st.incDir, inc, labels, attempts: st.attempts };
+  const proposals = await Promise.all(focusOrder(FOCUSES, k, count).map(f => propose(ctx, f, input)));
+  const concurrency = Math.max(1, Math.ceil(o.concurrency / proposals.length));
+  const trials = await Promise.all(proposals.map(p => trial(ctx, p, input, rules, concurrency)));
+  const best = pickBest(trials.filter((t): t is Judged => t.summary !== null), o.accept.on);
+  const record: RoundRecord = {
+    round: k, incumbent_dir: st.incDir, incumbent_from: st.incFrom, incumbent_eval: inc.out, incumbent_score: armSummary(inc.byMode.taste ?? []),
+    candidates: trials.map(t => t.rec), promoted: best?.rec.focus ?? null, cost: round(ctx.spent - before), spent_after: ctx.spent, totals: ctx.totals,
+  };
+  st.history.push(record);
+  st.attempts.push(...trials.map(t => ({ round: k, focus: t.rec.focus, accepted: t.rec.focus === record.promoted, reason: t.rec.reason, summary: t.rec.summary, diff: t.rec.diff, losses: t.rec.losses })));
+  if (best) Object.assign(st, { incDir: best.rec.dir, incFrom: k });
   writeHistory(ctx.opt, st.history);
+  log(`round ${k}: ${best ? `PROMOTED ${best.rec.focus}` : "no candidate promoted"}. Round cost $${record.cost.toFixed(2)}, total $${ctx.spent.toFixed(2)}`);
 }
 
-async function holdoutEvals(ctx: Ctx, original: string, best: Incumbent) {
-  const samples = ctx.options.holdoutSamples;
-  const base = await evaluate(ctx, "holdout-original", original, ctx.holdout, ["baseline", "taste"], samples);
-  const bestEval = best.round === 0 ? base : await evaluate(ctx, "holdout-best", best.dir, ctx.holdout, ["taste"], samples);
-  return { baseline: base.byMode.baseline ?? [], original: base.byMode.taste ?? [], best: bestEval.byMode.taste ?? [], dirs: { original: base.out, best: bestEval.out } };
+function nextPlan(ctx: Ctx, k: number) {
+  const o = ctx.options;
+  const units = unitCosts(ctx.totals);
+  const reserve = holdoutEstimate(units, ctx.holdout.length * o.holdoutSamples, true);
+  return planRound({ round: k, rounds: o.rounds, spent: ctx.spent, units, builds: ctx.train.length * o.samples, maxCandidates: o.candidates, reserve, budget: o.budgetUsd });
 }
 
-function armSummary(scores: BuildScore[]) {
-  const mean = (f: (s: BuildScore) => number | null | undefined) => evalScore(scores.map(s => ({ target: s.target, objective: f(s) ?? null })));
-  return { score: evalScore(scores), overall: mean(s => s.judge?.overall.score), rule_pass: mean(s => s.rules?.rule_pass) };
+async function runLoop(ctx: Ctx, st: LoopState, labels: CaseLabel): Promise<string> {
+  for (let k = st.nextRound; ; k++) {
+    const plan = nextPlan(ctx, k);
+    if (plan.stop) return plan.stop;
+    await oneRound(ctx, k, st, labels, plan.candidates);
+  }
+}
+
+type Holdout = { arms: Record<"baseline" | "original" | "best", ArmScore>; pairs: Record<string, PairSummary>; runs: { original: string; best: string } };
+
+async function holdoutEvals(ctx: Ctx, original: string, st: LoopState): Promise<Holdout> {
+  const hs = ctx.options.holdoutSamples;
+  const base = await evaluate(ctx, { name: "holdout-original", skillDir: original, targets: ctx.holdout, modes: ["baseline", "taste"], samples: hs, score: true });
+  const best = st.incFrom > 0 ? await evaluate(ctx, { name: "holdout-best", skillDir: st.incDir, targets: ctx.holdout, modes: ["taste"], samples: hs, score: true }) : base;
+  const rules = await loadRules(base.out);
+  const bestRef = { out: best.out, mode: "taste" };
+  const dir = (name: string) => join(ctx.opt, "holdout-pairs", name);
+  const conc = ctx.options.concurrency;
+  const pairs: Record<string, PairSummary> = {};
+  pairs.best_vs_baseline = (await pairUp(ctx, dir("best-vs-baseline"), { out: base.out, mode: "baseline" }, bestRef, ctx.holdout, hs, rules, conc)).summary;
+  if (st.incFrom > 0) pairs.best_vs_original = (await pairUp(ctx, dir("best-vs-original"), { out: base.out, mode: "taste" }, bestRef, ctx.holdout, hs, rules, conc)).summary;
+  const arms = { baseline: armSummary(base.byMode.baseline ?? []), original: armSummary(base.byMode.taste ?? []), best: armSummary(best.byMode.taste ?? []) };
+  return { arms, pairs, runs: { original: base.out, best: best.out } };
+}
+
+async function finish(ctx: Ctx, st: LoopState, original: string, stop: string) {
+  log(`stop: ${stop}. Best skill is from round ${st.incFrom}. Running holdout.`);
+  const h = await holdoutEvals(ctx, original, st);
+  const final = {
+    stop_reason: stop, best_round: st.incFrom, best_dir: st.incDir, original_dir: original, accept_rule: ctx.options.accept,
+    holdout_targets: ctx.holdout.map(t => t.id), holdout_samples: ctx.options.holdoutSamples,
+    holdout: h.arms, holdout_pairs: h.pairs, holdout_runs: h.runs, total_cost_usd: ctx.spent, cost_totals: ctx.totals,
+  };
+  writeFileSync(join(ctx.opt, "final.json"), JSON.stringify(final, null, 2));
+  await writeOptimizeReport(ctx.opt, final, st.history, await skillDiff(original, st.incDir));
+  log(`done. total $${ctx.spent.toFixed(2)}. ${join(ctx.opt, "report.html")}`);
 }
 
 function resolveTargets(all: Target[], split: "train" | "holdout", ids: string[] | null): Target[] {
@@ -275,40 +281,6 @@ function resolveTargets(all: Target[], split: "train" | "holdout", ids: string[]
   return selectTargets(pool, ids);
 }
 
-type Setup = { ctx: Ctx; labels: CaseLabel; original: string; st: LoopState; s0: MeanSe; reserve: number; saved: Proposal | null };
-
-function labelsFor(train: Target[]): CaseLabel {
-  return new Map(train.map((t, i) => [t.id, `case-${i + 1}`]));
-}
-
-async function freshSetup(options: OptimizeOptions): Promise<Setup> {
-  const all = loadTargets();
-  const opt = resolve(options.out ?? join(BENCH, "optimize", timestamp()));
-  mkdirSync(opt, { recursive: true });
-  const ctx: Ctx = { opt, options, train: resolveTargets(all, "train", options.trainTargets), holdout: resolveTargets(all, "holdout", options.holdoutTargets), spent: 0, resume: false };
-  writeFileSync(join(opt, "options.json"), JSON.stringify({ ...options, train: ctx.train.map(t => t.id), holdout: ctx.holdout.map(t => t.id) }, null, 2));
-  const original = originalSkill(opt);
-  log(`optimize ${opt}: train ${ctx.train.length} targets x ${options.samples}, holdout ${ctx.holdout.length} x ${options.holdoutSamples}, budget $${options.budgetUsd}`);
-  const e0 = await evaluate(ctx, "round-0-train", original, ctx.train, ["taste"], options.samples);
-  const s0 = evalScore(e0.byMode.taste ?? []);
-  const st: LoopState = { inc: { dir: original, round: 0, eval: e0, score: s0 }, history: [], attempts: [], streak: 0, lastRoundCost: e0.cost + PROPOSER_SLACK_USD };
-  st.history.push({ round: 0, candidate_dir: original, parent_dir: null, diff: "", lint: [], proposer_summary: "original skill", train: s0, incumbent: null, comparison: null, accepted: true, reason: "starting point", cost: { proposer: 0, eval: e0.cost, total: e0.cost }, spent_after: ctx.spent });
-  writeHistory(opt, st.history);
-  log(`round 0 (original): train ${s0.mean} +/- ${s0.se}`);
-  const reserve = holdoutReserve(e0.cost, e0.builds, ctx.holdout.length, options.holdoutSamples);
-  return { ctx, labels: labelsFor(ctx.train), original, st, s0, reserve, saved: null };
-}
-
-function savedEval(opt: string, name: string, cost: number): Eval {
-  const out = join(opt, "evals", name);
-  if (!existsSync(out)) throw new Error(`missing eval folder ${out}`);
-  const scores = buildDirs(out).map(d => readJson<BuildScore>(join(d, "score.json")));
-  if (scores.some(s => !currentScore(s))) throw new Error(`eval ${name} has builds without a current score.json`);
-  const byMode: Record<string, BuildScore[]> = {};
-  for (const s of scores as BuildScore[]) byMode[s.mode] = [...(byMode[s.mode] ?? []), s];
-  return { name, out, scores: scores as BuildScore[], byMode, cost, builds: scores.length };
-}
-
 function pickTargets(all: Target[], ids: string[]): Target[] {
   return ids.map(id => {
     const t = all.find(x => x.id === id);
@@ -317,70 +289,36 @@ function pickTargets(all: Target[], ids: string[]): Target[] {
   });
 }
 
-function savedRoundProposal(opt: string, k: number): Proposal | null {
-  const roundDir = join(opt, `round-${k}`);
-  const dir = join(roundDir, "candidate");
-  const raw = existsSync(join(roundDir, "proposer-transcript.json")) ? readFileSync(join(roundDir, "proposer-transcript.json"), "utf8") : null;
-  const p = savedProposal(SKILL_FILES.map(f => existsSync(join(dir, f))), raw === null ? null : parseClaudeOutput(raw));
-  return p ? { dir, ...p } : null;
+type Setup = { ctx: Ctx; st: LoopState; original: string; labels: CaseLabel };
+
+function labelsFor(train: Target[]): CaseLabel {
+  return new Map(train.map((t, i) => [t.id, `case-${i + 1}`]));
 }
 
-function prepareInterrupted(ctx: Ctx, k: number): Proposal | null {
-  const saved = savedRoundProposal(ctx.opt, k);
-  if (saved) {
-    ctx.spent = round(ctx.spent + saved.cost);
-    log(`round ${k}: saved proposal found ($${saved.cost.toFixed(2)}); its eval will reuse finished builds`);
-    return saved;
-  }
-  rmSync(join(ctx.opt, "evals", `round-${k}-train`), { recursive: true, force: true });
-  return null;
+function freshSetup(options: OptimizeOptions): Setup {
+  const all = loadTargets();
+  const opt = resolve(options.out ?? join(BENCH, "optimize", timestamp()));
+  if (existsSync(join(opt, "history.json"))) throw new Error(`${opt} already has a run; use --resume ${opt}`);
+  mkdirSync(opt, { recursive: true });
+  const ctx: Ctx = { opt, options, train: resolveTargets(all, "train", options.trainTargets), holdout: resolveTargets(all, "holdout", options.holdoutTargets), spent: 0, totals: EMPTY_TOTALS, resume: false };
+  writeFileSync(join(opt, "options.json"), JSON.stringify({ ...options, train: ctx.train.map(t => t.id), holdout: ctx.holdout.map(t => t.id) }, null, 2));
+  const original = originalSkill(opt);
+  writeHistory(opt, []);
+  log(`optimize ${opt}: train ${ctx.train.length} x ${options.samples}, ${options.candidates} candidates/round, holdout ${ctx.holdout.length} x ${options.holdoutSamples}, budget $${options.budgetUsd}`);
+  return { ctx, original, labels: labelsFor(ctx.train), st: { incDir: original, incFrom: 0, history: [], attempts: [], nextRound: 1 } };
 }
 
-async function resumeSetup(dir: string): Promise<Setup> {
+function resumeSetup(dir: string): Setup {
   const opt = resolve(dir);
   const stored = readJson<OptimizeOptions & { train: string[]; holdout: string[] }>(join(opt, "options.json"));
-  const history = readJson<HistoryEntry[]>(join(opt, "history.json"));
+  const history = readJson<RoundRecord[]>(join(opt, "history.json"));
   if (!stored || !history) throw new Error(`${opt} needs options.json and history.json`);
   const all = loadTargets();
-  const restored = restoreLoop(history);
-  const ctx: Ctx = { opt, options: stored, train: pickTargets(all, stored.train), holdout: pickTargets(all, stored.holdout), spent: restored.spent, resume: true };
   const original = join(opt, "original");
-  const e0 = savedEval(opt, "round-0-train", history[0]!.cost.eval);
-  const inc = restored.incumbent;
-  const incEval = inc.round === 0 ? e0 : savedEval(opt, `round-${inc.round}-train`, inc.cost.eval);
-  const st: LoopState = { inc: { dir: inc.candidate_dir, round: inc.round, eval: incEval, score: inc.train! }, history, attempts: restored.attempts, streak: restored.streak, lastRoundCost: restored.lastRoundCost };
-  const reserve = holdoutReserve(e0.cost, e0.builds, ctx.holdout.length, stored.holdoutSamples);
-  log(`resume ${opt}: ${history.length} rounds in history, incumbent round ${inc.round}, spent $${ctx.spent.toFixed(2)}, reject streak ${st.streak}`);
-  return { ctx, labels: labelsFor(ctx.train), original, st, s0: history[0]!.train!, reserve, saved: prepareInterrupted(ctx, restored.nextRound) };
-}
-
-async function runLoop(setup: Setup): Promise<string> {
-  const { ctx, st, labels, reserve } = setup;
-  const o = ctx.options;
-  let saved = setup.saved;
-  let stop: string | null = null;
-  for (let k = st.history.at(-1)!.round + 1; !stop; k++) {
-    stop = stopReason({ round: k, rounds: o.rounds, spent: ctx.spent, nextRound: st.lastRoundCost, reserve, budget: o.budgetUsd, rejectStreak: st.streak });
-    if (!stop) await oneRound(ctx, k, st, labels, saved);
-    saved = null;
-  }
-  return stop;
-}
-
-async function finish(setup: Setup, stop: string) {
-  const { ctx, st, original, s0 } = setup;
-  log(`stop: ${stop}. Best is round ${st.inc.round}. Running holdout.`);
-  const h = await holdoutEvals(ctx, original, st.inc);
-  const final = {
-    stop_reason: stop, best_round: st.inc.round, best_dir: st.inc.dir, original_dir: original, train_best: st.inc.score, train_original: s0,
-    holdout_targets: ctx.holdout.map(t => t.id), holdout_samples: ctx.options.holdoutSamples,
-    holdout: { baseline: armSummary(h.baseline), original: armSummary(h.original), best: armSummary(h.best) },
-    holdout_compare: { best_vs_original: compareEvals(h.original, h.best), original_vs_baseline: compareEvals(h.baseline, h.original), best_vs_baseline: compareEvals(h.baseline, h.best) },
-    holdout_runs: h.dirs, total_cost_usd: ctx.spent,
-  };
-  writeFileSync(join(ctx.opt, "final.json"), JSON.stringify(final, null, 2));
-  await writeOptimizeReport(ctx.opt, final, st.history, await skillDiff(original, st.inc.dir));
-  log(`done. total $${ctx.spent.toFixed(2)}. ${join(ctx.opt, "report.html")}`);
+  const r = restoreRounds(history, original);
+  const ctx: Ctx = { opt, options: stored, train: pickTargets(all, stored.train), holdout: pickTargets(all, stored.holdout), spent: r.spent, totals: r.totals, resume: true };
+  log(`resume ${opt}: ${history.length} rounds done, incumbent from round ${r.incumbentFrom}, spent $${ctx.spent.toFixed(2)}`);
+  return { ctx, original, labels: labelsFor(ctx.train), st: { incDir: r.incumbentDir, incFrom: r.incumbentFrom, history, attempts: r.attempts, nextRound: r.nextRound } };
 }
 
 export function resumeArg(argv: string[]): string | null {
@@ -395,8 +333,8 @@ export function resumeArg(argv: string[]): string | null {
 async function main() {
   const argv = process.argv.slice(2);
   const dir = resumeArg(argv);
-  const setup = dir ? await resumeSetup(dir) : await freshSetup(parseOptimizeArgs(argv));
-  await finish(setup, await runLoop(setup));
+  const { ctx, st, original, labels } = dir ? resumeSetup(dir) : freshSetup(parseOptimizeArgs(argv));
+  await finish(ctx, st, original, await runLoop(ctx, st, labels));
 }
 
 if (import.meta.main) await main();

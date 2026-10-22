@@ -42,7 +42,7 @@ async function pixelScores(targetPng: string, buildPng: string, target: Target) 
   return { ssim: ssimFromPixels(ga, gb, width, height), histogram_distance: histogramDistance(colorHistogram(ca), colorHistogram(cb)) };
 }
 
-async function inTempDir<T>(files: Record<string, string>, work: (dir: string) => Promise<T>): Promise<T> {
+export async function inTempDir<T>(files: Record<string, string>, work: (dir: string) => Promise<T>): Promise<T> {
   const dir = mkdtempSync(join(tmpdir(), "bench-judge-"));
   for (const [name, from] of Object.entries(files)) copyFileSync(from, join(dir, name));
   try {
@@ -52,9 +52,9 @@ async function inTempDir<T>(files: Record<string, string>, work: (dir: string) =
   }
 }
 
-type Verdict<T> = { value?: T; cost: number; error?: string };
+export type Verdict<T> = { value?: T; cost: number; error?: string };
 
-async function askTwice<T>(dir: string, prompt: string, model: string, parse: (text: string) => T): Promise<Verdict<T>> {
+export async function askTwice<T>(dir: string, prompt: string, model: string, parse: (text: string) => T): Promise<Verdict<T>> {
   let cost = 0;
   let error = "";
   for (let attempt = 0; attempt < 2; attempt++) {

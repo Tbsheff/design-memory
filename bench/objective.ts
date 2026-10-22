@@ -3,7 +3,6 @@ import type { BuildScore, Judgement, RuleResult, RuleSummary, RuleVerdict, Split
 
 export const OVERALL_WEIGHT = 0.7;
 export const RULE_WEIGHT = 0.3;
-export const MIN_GAIN = 0.02;
 export const HTML_LIMIT = 40_000;
 
 export function splitTargets(targets: Target[], split: Split): Target[] {
@@ -115,25 +114,11 @@ export function evalScore(scores: Scored[]): MeanSe {
   return meanSe(scores.map(s => s.objective ?? NaN));
 }
 
-function targetMeans(scores: Scored[]): Map<string, number> {
-  const out = new Map<string, number>();
-  for (const t of new Set(scores.map(s => s.target))) {
-    const m = meanSe(scores.filter(s => s.target === t).map(s => s.objective ?? NaN));
-    if (m.n) out.set(t, m.mean);
-  }
-  return out;
-}
+export type ArmScore = { score: MeanSe; overall: MeanSe; rule_pass: MeanSe };
 
-export type Comparison = { diff: number; se: number; targets: number; threshold: number; accept: boolean };
-
-export function compareEvals(incumbent: Scored[], candidate: Scored[], minGain = MIN_GAIN): Comparison {
-  const a = targetMeans(incumbent);
-  const b = targetMeans(candidate);
-  const diffs = [...a.keys()].filter(t => b.has(t)).map(t => b.get(t)! - a.get(t)!);
-  const d = meanSe(diffs);
-  const diff = d.n ? d.mean : NaN;
-  const threshold = round(Math.max(d.n ? d.se : 0, minGain));
-  return { diff, se: d.se, targets: d.n, threshold, accept: d.n > 0 && diff >= minGain && diff > d.se };
+export function armSummary(scores: BuildScore[]): ArmScore {
+  const mean = (f: (s: BuildScore) => number | null | undefined) => evalScore(scores.map(s => ({ target: s.target, objective: f(s) ?? null })));
+  return { score: evalScore(scores), overall: mean(s => s.judge?.overall.score), rule_pass: mean(s => s.rules?.rule_pass) };
 }
 
 export function worstBuilds<T extends Scored>(scores: T[], count: number): T[] {
@@ -183,13 +168,4 @@ export function lintCandidate(input: LintInput): string[] {
   }
   for (const link of brokenLinks(all)) problems.push(`broken link: ${link}`);
   return problems;
-}
-
-export type StopState = { round: number; rounds: number; spent: number; nextRound: number; reserve: number; budget: number; rejectStreak: number };
-
-export function stopReason(s: StopState): string | null {
-  if (s.round > s.rounds) return `finished ${s.rounds} rounds`;
-  if (s.rejectStreak >= 2) return "2 rejections in a row with no gain";
-  if (s.spent + s.nextRound + s.reserve > s.budget) return `budget: spent $${s.spent.toFixed(2)} + next round about $${s.nextRound.toFixed(2)} + holdout reserve $${s.reserve.toFixed(2)} > $${s.budget.toFixed(2)}`;
-  return null;
 }

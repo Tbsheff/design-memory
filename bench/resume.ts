@@ -1,16 +1,9 @@
 import { existsSync, readFileSync } from "node:fs";
 import { round } from "./lib.ts";
-import type { Comparison, MeanSe } from "./objective.ts";
-
-export type Attempt = { round: number; accepted: boolean; reason: string; summary: string; diff: string };
-
-export type HistoryEntry = {
-  round: number; candidate_dir: string; parent_dir: string | null; diff: string; lint: string[]; proposer_summary: string;
-  train: MeanSe | null; incumbent: MeanSe | null; comparison: Comparison | null; accepted: boolean; reason: string;
-  cost: { proposer: number; eval: number; total: number }; spent_after: number;
-};
-
-export const PROPOSER_SLACK_USD = 2;
+import type { ArmScore } from "./objective.ts";
+import type { Attempt } from "./optimize-feedback.ts";
+import { EMPTY_TOTALS } from "./pairwise.ts";
+import type { CostTotals, PairSummary } from "./pairwise.ts";
 
 export function readJson<T = unknown>(path: string): T | null {
   if (!existsSync(path)) return null;
@@ -41,45 +34,30 @@ export function splitJobs<J, M>(jobs: J[], key: (job: J) => JobKey, savedMeta: (
   return out;
 }
 
-export function holdoutReserve(round0EvalCost: number, round0Builds: number, holdoutTargets: number, holdoutSamples: number): number {
-  return round((round0EvalCost / Math.max(1, round0Builds)) * holdoutTargets * holdoutSamples * 3);
+export type CandidateCost = { proposer: number; builds: number; pairs: number; total: number };
+export type CandidateRecord = {
+  focus: string; dir: string; diff: string; lint: string[]; summary: string; eval_dir: string | null;
+  pairs: PairSummary | null; accepted: boolean; reason: string; losses: string[]; cost: CandidateCost;
+};
+export type RoundRecord = {
+  round: number; incumbent_dir: string; incumbent_from: number; incumbent_eval: string; incumbent_score: ArmScore;
+  candidates: CandidateRecord[]; promoted: string | null; cost: number; spent_after: number; totals: CostTotals;
+};
+
+export function attemptsFrom(history: RoundRecord[]): Attempt[] {
+  return history.flatMap(h => h.candidates.map(c => ({ round: h.round, focus: c.focus, accepted: h.promoted === c.focus, reason: c.reason, summary: c.summary, diff: c.diff, losses: c.losses })));
 }
 
-export function attemptsFrom(history: HistoryEntry[]): Attempt[] {
-  return history.filter(h => h.round > 0).map(h => ({ round: h.round, accepted: h.accepted, reason: h.reason, summary: h.proposer_summary, diff: h.diff }));
-}
+export type Restored = { incumbentDir: string; incumbentFrom: number; spent: number; totals: CostTotals; attempts: Attempt[]; nextRound: number };
 
-export function rejectStreak(history: HistoryEntry[]): number {
-  let n = 0;
-  for (const h of [...history].reverse()) {
-    if (h.accepted) break;
-    n++;
-  }
-  return n;
-}
-
-export function largestRoundCost(history: HistoryEntry[]): number {
-  const first = (history[0]?.cost.eval ?? 0) + PROPOSER_SLACK_USD;
-  return Math.max(first, ...history.slice(1).map(h => h.cost.total));
-}
-
-export function lastAccepted(history: HistoryEntry[]): HistoryEntry {
-  const entry = [...history].reverse().find(h => h.accepted);
-  if (!entry) throw new Error("history has no accepted round; cannot resume");
-  return entry;
-}
-
-export type RestoredLoop = { incumbent: HistoryEntry; spent: number; attempts: Attempt[]; streak: number; lastRoundCost: number; nextRound: number };
-
-export function restoreLoop(history: HistoryEntry[]): RestoredLoop {
-  if (!history.length || history[0]!.round !== 0) throw new Error("history must start with round 0");
+export function restoreRounds(history: RoundRecord[], original: string): Restored {
+  const last = history.at(-1);
+  if (!last) return { incumbentDir: original, incumbentFrom: 0, spent: 0, totals: EMPTY_TOTALS, attempts: [], nextRound: 1 };
+  const promoted = last.candidates.find(c => c.focus === last.promoted);
   return {
-    incumbent: lastAccepted(history),
-    spent: history.at(-1)!.spent_after,
-    attempts: attemptsFrom(history),
-    streak: rejectStreak(history),
-    lastRoundCost: largestRoundCost(history),
-    nextRound: history.at(-1)!.round + 1,
+    incumbentDir: promoted ? promoted.dir : last.incumbent_dir,
+    incumbentFrom: promoted ? last.round : last.incumbent_from,
+    spent: last.spent_after, totals: last.totals, attempts: attemptsFrom(history), nextRound: last.round + 1,
   };
 }
 

@@ -3,17 +3,20 @@ import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { resumeArg } from "../bench/optimize.ts";
-import {
-  attemptsFrom, holdoutReserve, largestRoundCost, metaMatches, readJson, rejectStreak, restoreLoop, savedProposal, splitJobs,
-} from "../bench/resume.ts";
-import type { HistoryEntry } from "../bench/resume.ts";
+import { attemptsFrom, metaMatches, readJson, restoreRounds, savedProposal, splitJobs } from "../bench/resume.ts";
+import type { CandidateRecord, RoundRecord } from "../bench/resume.ts";
+import { EMPTY_TOTALS } from "../bench/pairwise.ts";
 import { currentScore } from "../bench/score.ts";
 import type { BuildScore } from "../bench/lib.ts";
 
-const entry = (round: number, accepted: boolean, total: number, spent: number, evalCost = total): HistoryEntry => ({
-  round, candidate_dir: `/opt/round-${round}/candidate`, parent_dir: round ? "/opt/original" : null, diff: `diff ${round}`, lint: [],
-  proposer_summary: `summary ${round}`, train: { n: 10, mean: 0.6 + round / 100, se: 0.01 }, incumbent: null, comparison: null,
-  accepted, reason: accepted ? "ok" : "no gain", cost: { proposer: total - evalCost, eval: evalCost, total }, spent_after: spent,
+const ms = { n: 10, mean: 0.6, se: 0.01 };
+const cand = (round: number, focus: string, accepted: boolean): CandidateRecord => ({
+  focus, dir: `/opt/round-${round}/cand-${focus}/candidate`, diff: `diff ${round} ${focus}`, lint: [], summary: `summary ${focus}`, eval_dir: null,
+  pairs: null, accepted, reason: accepted ? "beats" : "no", losses: [`closer: loss ${focus}`], cost: { proposer: 0.3, builds: 2, pairs: 1, total: 3.3 },
+});
+const roundRec = (round: number, incumbent: string, from: number, promoted: string | null, spent: number, candidates: CandidateRecord[]): RoundRecord => ({
+  round, incumbent_dir: incumbent, incumbent_from: from, incumbent_eval: `/opt/evals/round-${round}-incumbent`, incumbent_score: { score: ms, overall: ms, rule_pass: ms },
+  candidates, promoted, cost: 10, spent_after: spent, totals: { ...EMPTY_TOTALS, builds: round * 40, build_usd: round * 9 },
 });
 
 describe("which builds are missing", () => {
@@ -59,41 +62,30 @@ describe("which builds are missing", () => {
 });
 
 describe("restoring the loop", () => {
-  test("keeps the original as incumbent after a rejection and counts spent cost", () => {
-    const history = [entry(0, true, 5.0158, 5.0158), entry(1, false, 5.2919, 10.3077, 5.0357)];
-    const r = restoreLoop(history);
-    expect(r.incumbent.round).toBe(0);
-    expect(r.spent).toBe(10.3077);
-    expect(r.streak).toBe(1);
-    expect(r.nextRound).toBe(2);
-    expect(r.lastRoundCost).toBeCloseTo(7.0158, 6);
-    expect(r.attempts).toEqual([{ round: 1, accepted: false, reason: "no gain", summary: "summary 1", diff: "diff 1" }]);
+  test("an empty history starts round 1 from the original", () => {
+    expect(restoreRounds([], "/opt/original")).toEqual({ incumbentDir: "/opt/original", incumbentFrom: 0, spent: 0, totals: EMPTY_TOTALS, attempts: [], nextRound: 1 });
   });
 
-  test("picks the last accepted round and resets the streak", () => {
-    const history = [entry(0, true, 5, 5), entry(1, true, 5.5, 10.5), entry(2, false, 9, 19.5), entry(3, true, 5, 24.5)];
-    const r = restoreLoop(history);
-    expect(r.incumbent.round).toBe(3);
-    expect(r.incumbent.candidate_dir).toBe("/opt/round-3/candidate");
-    expect(r.streak).toBe(0);
-    expect(r.spent).toBe(24.5);
-    expect(largestRoundCost(history)).toBe(9);
+  test("keeps the incumbent when no candidate was promoted", () => {
+    const r = restoreRounds([roundRec(1, "/opt/original", 0, null, 18, [cand(1, "craft", false), cand(1, "process", false)])], "/opt/original");
+    expect(r).toMatchObject({ incumbentDir: "/opt/original", incumbentFrom: 0, spent: 18, nextRound: 2 });
+    expect(r.totals.builds).toBe(40);
+    expect(r.attempts.map(a => [a.focus, a.accepted, a.losses[0]])).toEqual([["craft", false, "closer: loss craft"], ["process", false, "closer: loss process"]]);
   });
 
-  test("streak counts only trailing rejections", () => {
-    expect(rejectStreak([entry(0, true, 5, 5), entry(1, false, 5, 10), entry(2, true, 5, 15), entry(3, false, 5, 20), entry(4, false, 5, 25)])).toBe(2);
-    expect(attemptsFrom([entry(0, true, 5, 5)])).toEqual([]);
+  test("takes the promoted candidate of the last round, not one that only passed", () => {
+    const history = [
+      roundRec(1, "/opt/original", 0, "rules", 18, [cand(1, "craft", true), cand(1, "rules", true)]),
+      roundRec(2, "/opt/round-1/cand-rules/candidate", 1, null, 36, [cand(2, "craft", false)]),
+    ];
+    const r = restoreRounds(history, "/opt/original");
+    expect(r).toMatchObject({ incumbentDir: "/opt/round-1/cand-rules/candidate", incumbentFrom: 1, spent: 36, nextRound: 3 });
+    expect(attemptsFrom(history).map(a => [a.round, a.focus, a.accepted])).toEqual([[1, "craft", false], [1, "rules", true], [2, "craft", false]]);
   });
 
-  test("rejects a history that cannot resume", () => {
-    expect(() => restoreLoop([])).toThrow();
-    expect(() => restoreLoop([entry(1, true, 5, 5)])).toThrow();
-    expect(() => restoreLoop([entry(0, false, 5, 5)])).toThrow("no accepted round");
-  });
-
-  test("holdout reserve matches the fresh-run formula", () => {
-    expect(holdoutReserve(5, 10, 3, 2)).toBe(9);
-    expect(holdoutReserve(5, 0, 3, 2)).toBe(90);
+  test("a promotion in the last round becomes the incumbent", () => {
+    const r = restoreRounds([roundRec(1, "/opt/original", 0, "craft", 18, [cand(1, "craft", true)])], "/opt/original");
+    expect(r).toMatchObject({ incumbentDir: "/opt/round-1/cand-craft/candidate", incumbentFrom: 1 });
   });
 });
 
